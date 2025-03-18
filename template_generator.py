@@ -141,7 +141,7 @@ def create_excel_template():
     # Sheet 9: MonthlyDemand
     monthly_demand = pd.DataFrame({
         'Month': list(range(1, 13)),  # 1-12 for Jan-Dec
-        'Demand': [1, 1, 2, 1, 1, 0, 1, 1, 2, 1, 1, 0]  # Target courses per month
+        'Percentage': [8.3, 8.3, 16.7, 8.3, 8.3, 0, 8.3, 8.3, 16.7, 8.3, 8.3, 0]  # Percentages (adding up to ~100%)
     })
     monthly_demand.to_excel(writer, sheet_name='MonthlyDemand', index=False)
 
