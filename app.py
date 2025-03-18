@@ -912,10 +912,15 @@ def main():
         6. **PublicHolidays**: Holiday periods
            - Columns: Start Date, End Date
 
-        7. **Fleximatrix**: Trainer-course qualifications
-           - Columns: Course, Language, Trainer, IsChampion
+        7. **Fleximatrix**: Trainer-course qualifications (wide format)
+           - Columns: CourseName, CategoryName, Language, Champion, [Trainer1], [Trainer2], etc.
+           - "U" in cells indicates trainer qualification
+           - Champion column contains the trainer code who is the champion
 
-        8. **MonthlyDemand**: Monthly course distribution targets
+        8. **WeekRestrictions**: Course week position constraints (optional)
+           - Columns: Course, Week Type, Restricted, Notes
+
+        9. **MonthlyDemand**: Monthly course distribution targets
            - Columns: Month, Demand
         """)
 
