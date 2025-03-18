@@ -1035,18 +1035,6 @@ def main():
             help="Target percentage of max workdays for trainers (higher = more work assigned)"
         )
 
-        # Advanced optimization parameters
-        st.header("4. Set Optimization Parameters")
-
-        # Basic weights (as before)
-        col1, col2 = st.columns(2)
-        with col1:
-            monthly_weight = st.slider("Monthly Distribution Priority", 1, 10, 5)
-            champion_weight = st.slider("Champion Assignment Priority", 1, 10, 4)
-        with col2:
-            utilization_weight = st.slider("Trainer Utilization Priority", 1, 10, 3)
-            affinity_weight = st.slider("Course Affinity Priority", 1, 10, 2)
-
         # Advanced options in an expander
         with st.expander("Advanced Optimization Settings"):
             # Solver time limit
