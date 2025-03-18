@@ -859,13 +859,27 @@ class CourseScheduler:
 
     def generate_excel_report(self, schedule_df, monthly_validation_df, trainer_utilization_df):
         """Generate an Excel report with multiple sheets containing all results"""
-        import io  # Add this line
+        import io
         output = io.BytesIO()
 
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            schedule_df.to_excel(writer, sheet_name='Schedule', index=False)
-            monthly_validation_df.to_excel(writer, sheet_name='Monthly Validation', index=False)
-            trainer_utilization_df.to_excel(writer, sheet_name='Trainer Utilization', index=False)
+            if schedule_df is not None:
+                schedule_df.to_excel(writer, sheet_name='Schedule', index=False)
+            else:
+                # Create an empty DataFrame if None
+                pd.DataFrame(columns=["No data available"]).to_excel(writer, sheet_name='Schedule', index=False)
+
+            if monthly_validation_df is not None:
+                monthly_validation_df.to_excel(writer, sheet_name='Monthly Validation', index=False)
+            else:
+                pd.DataFrame(columns=["No data available"]).to_excel(writer, sheet_name='Monthly Validation',
+                                                                     index=False)
+
+            if trainer_utilization_df is not None:
+                trainer_utilization_df.to_excel(writer, sheet_name='Trainer Utilization', index=False)
+            else:
+                pd.DataFrame(columns=["No data available"]).to_excel(writer, sheet_name='Trainer Utilization',
+                                                                     index=False)
 
         output.seek(0)
         return output
