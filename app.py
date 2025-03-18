@@ -262,7 +262,9 @@ class CourseScheduler:
 
     def run_optimization(self, monthly_weight=5, champion_weight=4,
                          utilization_weight=3, affinity_weight=2,
-                         utilization_target=70):
+                         utilization_target=70, solver_time_minutes=5,
+                         num_workers=8, min_course_spacing=2,
+                         solution_strategy="BALANCED"):
         """Run the optimization model to create the schedule"""
         print("Starting optimization with trainer assignments...")
 
@@ -413,9 +415,8 @@ class CourseScheduler:
                 run_num1, var1 = course_runs[i]
                 run_num2, var2 = course_runs[i + 1]
 
-                # Hard constraint for minimum spacing
-                min_gap = 2  # Weeks between runs of same course
-                model.Add(var2 >= var1 + min_gap)
+                # Use the dynamic minimum spacing
+                model.Add(var2 >= var1 + min_course_spacing)
 
         # CONSTRAINT 3: Add constraints for course affinities
         print(f"Adding affinity constraints for course pairs")
@@ -563,8 +564,15 @@ class CourseScheduler:
 
         # Initialize solver with increased time limit
         solver = cp_model.CpSolver()
-        solver.parameters.max_time_in_seconds = 300  # 5 minutes time limit
+        solver.parameters.max_time_in_seconds = solver_time_minutes * 60  # Convert to seconds
+        solver.parameters.num_search_workers = num_workers
 
+        # Set solution strategy
+        if solution_strategy == "MAXIMIZE_QUALITY":
+            solver.parameters.optimize_with_max_hs = True
+        elif solution_strategy == "FIND_FEASIBLE_FAST":
+            solver.parameters.search_branching = cp_model.FIXED_SEARCH
+            solver.parameters.optimize_with_core = False
         # Solve the model
         status = solver.Solve(model)
 
@@ -1026,18 +1034,81 @@ def main():
             value=70,
             help="Target percentage of max workdays for trainers (higher = more work assigned)"
         )
-        # Step 4: Run Optimization
+
+        # Advanced optimization parameters
+        st.header("4. Set Optimization Parameters")
+
+        # Basic weights (as before)
+        col1, col2 = st.columns(2)
+        with col1:
+            monthly_weight = st.slider("Monthly Distribution Priority", 1, 10, 5)
+            champion_weight = st.slider("Champion Assignment Priority", 1, 10, 4)
+        with col2:
+            utilization_weight = st.slider("Trainer Utilization Priority", 1, 10, 3)
+            affinity_weight = st.slider("Course Affinity Priority", 1, 10, 2)
+
+        # Advanced options in an expander
+        with st.expander("Advanced Optimization Settings"):
+            # Solver time limit
+            solver_time = st.slider(
+                "Solver Time Limit (minutes)",
+                min_value=1,
+                max_value=60,
+                value=5,
+                help="Maximum time the optimizer will run before returning best solution found"
+            )
+
+            # Number of search workers (parallel threads)
+            num_workers = st.slider(
+                "Number of Search Workers",
+                min_value=1,
+                max_value=16,
+                value=8,
+                help="More workers can find solutions faster but use more CPU"
+            )
+
+            # Minimum spacing between course runs
+            min_course_spacing = st.slider(
+                "Minimum Weeks Between Course Runs",
+                min_value=1,
+                max_value=10,
+                value=2,
+                help="Minimum gap weeks between runs of the same course"
+            )
+
+            # Target utilization percentage
+            utilization_target = st.slider(
+                "Target Utilization Percentage",
+                min_value=50,
+                max_value=90,
+                value=70,
+                help="Target percentage of max workdays for trainers"
+            )
+
+            # Option to prioritize better solutions vs. finding any solution
+            solution_strategy = st.selectbox(
+                "Solution Strategy",
+                options=["BALANCED", "MAXIMIZE_QUALITY", "FIND_FEASIBLE_FAST"],
+                index=0,
+                help="BALANCED = Default, MAXIMIZE_QUALITY = Best solution but slower, FIND_FEASIBLE_FAST = Any valid solution quickly"
+            )
+
+        # Step 5: Run Optimization
         if st.session_state.scheduler.weekly_calendar is not None:
-            st.header("4. Run Optimization")
+            st.header("5. Run Optimization")
 
             if st.button("Optimize Schedule"):
-                with st.spinner("Running optimization (this may take a few minutes)..."):
+                with st.spinner(f"Running optimization (maximum time: {solver_time} minutes)..."):
                     status, schedule_df, solver, schedule, trainer_assignments = st.session_state.scheduler.run_optimization(
                         monthly_weight=monthly_weight,
                         champion_weight=champion_weight,
                         utilization_weight=utilization_weight,
                         affinity_weight=affinity_weight,
-                        utilization_target=utilization_target
+                        utilization_target=utilization_target,
+                        solver_time_minutes=solver_time,
+                        num_workers=num_workers,
+                        min_course_spacing=min_course_spacing,
+                        solution_strategy=solution_strategy
                     )
                 with st.spinner("Running optimization (this may take a few minutes)..."):
                     status, schedule_df, solver, schedule, trainer_assignments = st.session_state.scheduler.run_optimization()
