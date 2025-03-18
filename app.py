@@ -260,8 +260,9 @@ class CourseScheduler:
         title = self.consultant_data.loc[self.consultant_data["Name"] == trainer_name, "Title"].iloc[0]
         return title == "Freelancer"
 
-
-    def run_optimization(self):
+    def run_optimization(self, monthly_weight=5, champion_weight=4,
+                         utilization_weight=3, affinity_weight=2,
+                         utilization_target=70):
         """Run the optimization model to create the schedule"""
         print("Starting optimization with trainer assignments...")
 
@@ -538,7 +539,7 @@ class CourseScheduler:
                 # 4.4: For non-freelancers, encourage higher utilization (soft constraint)
                 if not self.is_freelancer(trainer):
                     # Calculate target utilization as a percentage of max days
-                    target_days = int(max_days * 0.7)  # Target 70% utilization
+                    target_days = int(max_days * (utilization_target / 100))  # Target 70% utilization
 
                     # Add penalty for underutilization
                     under_target = model.NewBoolVar(f"{trainer}_under_target")
@@ -554,10 +555,10 @@ class CourseScheduler:
 
         # Combined objective function with balanced weights
         model.Minimize(
-            5 * sum(month_deviation_penalties) +  # Monthly distribution (higher priority)
-            2 * sum(affinity_penalties) +  # Affinity constraints (medium priority)
-            4 * sum(champion_assignment_penalties) +  # Champion assignment (high priority)
-            3 * sum(trainer_utilization_penalties)  # Trainer utilization (medium-high priority)
+            monthly_weight * sum(month_deviation_penalties) +
+            affinity_weight * sum(affinity_penalties) +
+            champion_weight * sum(champion_assignment_penalties) +
+            utilization_weight * sum(trainer_utilization_penalties)
         )
 
         # Initialize solver with increased time limit
@@ -978,11 +979,66 @@ def main():
                     else:
                         st.error("Failed to create calendar")
 
-        # Step 3: Run Optimization
+        st.header("3. Set Optimization Priorities")
+
+        # Create columns for the sliders
+        col1, col2 = st.columns(2)
+
+        with col1:
+            monthly_weight = st.slider(
+                "Monthly Distribution Priority",
+                min_value=1,
+                max_value=10,
+                value=5,
+                help="Higher priority means closer adherence to monthly demand targets"
+            )
+
+            champion_weight = st.slider(
+                "Champion Assignment Priority",
+                min_value=1,
+                max_value=10,
+                value=4,
+                help="Higher priority means champions are more likely to teach their own courses"
+            )
+
+        with col2:
+            utilization_weight = st.slider(
+                "Trainer Utilization Priority",
+                min_value=1,
+                max_value=10,
+                value=3,
+                help="Higher priority means trainers will have more balanced workloads"
+            )
+
+            affinity_weight = st.slider(
+                "Course Affinity Priority",
+                min_value=1,
+                max_value=10,
+                value=2,
+                help="Higher priority means better spacing between related courses"
+            )
+
+        # Utilization Target %
+        utilization_target = st.slider(
+            "Target Utilization Percentage",
+            min_value=50,
+            max_value=90,
+            value=70,
+            help="Target percentage of max workdays for trainers (higher = more work assigned)"
+        )
+        # Step 4: Run Optimization
         if st.session_state.scheduler.weekly_calendar is not None:
-            st.header("3. Run Optimization")
+            st.header("4. Run Optimization")
 
             if st.button("Optimize Schedule"):
+                with st.spinner("Running optimization (this may take a few minutes)..."):
+                    status, schedule_df, solver, schedule, trainer_assignments = st.session_state.scheduler.run_optimization(
+                        monthly_weight=monthly_weight,
+                        champion_weight=champion_weight,
+                        utilization_weight=utilization_weight,
+                        affinity_weight=affinity_weight,
+                        utilization_target=utilization_target
+                    )
                 with st.spinner("Running optimization (this may take a few minutes)..."):
                     status, schedule_df, solver, schedule, trainer_assignments = st.session_state.scheduler.run_optimization()
 
