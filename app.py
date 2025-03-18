@@ -734,14 +734,19 @@ class CourseScheduler:
         # Return the figure
         return plt.gcf()
 
-
     def generate_monthly_validation(self, schedule, solver):
         """Generates a monthly validation report for the schedule"""
         # Get adjusted F2F demand from the monthly demand dataframe
         adjusted_f2f_demand = {}
+
+        # Create the dictionary using the same logic as in run_optimization
+        total_f2f_runs = sum(self.course_run_data["Runs"])
+        total_percentage = self.monthly_demand['Percentage'].sum()
+
         for _, row in self.monthly_demand.iterrows():
             month = row['Month']
-            demand = row['Demand']
+            percentage = row['Percentage'] / total_percentage
+            demand = round(percentage * total_f2f_runs)
             adjusted_f2f_demand[month] = demand
 
         # Count courses by month
@@ -789,7 +794,6 @@ class CourseScheduler:
         })
 
         return pd.DataFrame(validation_data)
-
 
     def generate_trainer_utilization_report(self, schedule, trainer_assignments, solver):
         """Generates a report on trainer utilization"""
@@ -904,7 +908,7 @@ def main():
                     else:
                         st.error("Failed to load data. Please check your Excel file format.")
 
-    with col2:  
+    with col2:
         st.subheader("Required Excel Sheets")
         st.markdown("""
         Your Excel file should contain the following sheets:
