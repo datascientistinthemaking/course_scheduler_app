@@ -857,9 +857,9 @@ class CourseScheduler:
 
         return pd.DataFrame(utilization_data)
 
-
     def generate_excel_report(self, schedule_df, monthly_validation_df, trainer_utilization_df):
         """Generate an Excel report with multiple sheets containing all results"""
+        import io  # Add this line
         output = io.BytesIO()
 
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
