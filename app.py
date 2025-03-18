@@ -269,12 +269,27 @@ def run_optimization(self):
     total_f2f_runs = sum(self.course_run_data["Runs"])
 
     # Create adjusted monthly demand dictionary from the demand dataframe
+    # Convert percentages to actual course counts
     adjusted_f2f_demand = {}
+    total_percentage = self.monthly_demand['Percentage'].sum()
+
     for _, row in self.monthly_demand.iterrows():
         month = row['Month']
-        demand = row['Demand']
+        percentage = row['Percentage'] / total_percentage  # Normalize to ensure percentages sum to 1
+        # Calculate how many courses should be in this month (round to nearest integer)
+        demand = round(percentage * total_f2f_runs)
         adjusted_f2f_demand[month] = demand
 
+    # Adjust rounding errors to ensure total matches
+    total_allocated = sum(adjusted_f2f_demand.values())
+    if total_allocated != total_f2f_runs:
+        # Find the month with the highest demand and adjust
+        max_month = max(adjusted_f2f_demand.items(), key=lambda x: x[1])[0]
+        adjusted_f2f_demand[max_month] += (total_f2f_runs - total_allocated)
+
+    print("Monthly demand (converted from percentages):")
+    for month, demand in sorted(adjusted_f2f_demand.items()):
+        print(f"Month {month}: {demand} courses")
     # Initialize model and variables
     model = cp_model.CpModel()
     schedule = {}
