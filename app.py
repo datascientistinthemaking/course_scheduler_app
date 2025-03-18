@@ -7,6 +7,8 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from ortools.sat.python import cp_model
 
+st.set_page_config(page_title="Course Scheduler", layout="wide")
+
 # Import template generator
 from template_generator import create_excel_template
 
@@ -852,7 +854,7 @@ def generate_excel_report(self, schedule_df, monthly_validation_df, trainer_util
 
 # Create Streamlit application
 def main():
-    st.set_page_config(page_title="Course Scheduler", layout="wide")
+
 
     st.title("Course Scheduler App")
     st.write("Upload your Excel file with course and trainer data to generate an optimized schedule.")
