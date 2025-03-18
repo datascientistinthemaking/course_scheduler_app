@@ -265,7 +265,7 @@ class CourseScheduler:
                          utilization_target=70, solver_time_minutes=5,
                          num_workers=8, min_course_spacing=2,
                          solution_strategy="BALANCED"):
-        """Run the optimization model to create the schedule"""
+        """Run the optimization model with customizable parameters"""
         print("Starting optimization with trainer assignments...")
 
         # Get total F2F runs
@@ -293,6 +293,7 @@ class CourseScheduler:
         print("Monthly demand (converted from percentages):")
         for month, demand in sorted(adjusted_f2f_demand.items()):
             print(f"Month {month}: {demand} courses")
+
         # Initialize model and variables
         model = cp_model.CpModel()
         schedule = {}
@@ -307,8 +308,8 @@ class CourseScheduler:
 
         # Create the schedule variables for each course and run
         for _, row in self.course_run_data.iterrows():
-            course, methodology, language, runs, duration = row["Course Name"], row["Methodology"], row["Language"], row[
-                "Runs"], row["Duration"]
+            course, methodology, language, runs, duration = row["Course Name"], row["Methodology"], row["Language"], \
+            row["Runs"], row["Duration"]
 
             for i in range(runs):
                 # Create a variable for the start week
@@ -415,7 +416,7 @@ class CourseScheduler:
                 run_num1, var1 = course_runs[i]
                 run_num2, var2 = course_runs[i + 1]
 
-                # Use the dynamic minimum spacing
+                # Hard constraint for minimum spacing (using the parameter)
                 model.Add(var2 >= var1 + min_course_spacing)
 
         # CONSTRAINT 3: Add constraints for course affinities
@@ -540,7 +541,7 @@ class CourseScheduler:
                 # 4.4: For non-freelancers, encourage higher utilization (soft constraint)
                 if not self.is_freelancer(trainer):
                     # Calculate target utilization as a percentage of max days
-                    target_days = int(max_days * (utilization_target / 100))  # Target 70% utilization
+                    target_days = int(max_days * (utilization_target / 100))  # Use the parameter
 
                     # Add penalty for underutilization
                     under_target = model.NewBoolVar(f"{trainer}_under_target")
@@ -554,7 +555,7 @@ class CourseScheduler:
                     for _ in range(penalty_weight):
                         trainer_utilization_penalties.append(under_target)
 
-        # Combined objective function with balanced weights
+        # Combined objective function with dynamic weights
         model.Minimize(
             monthly_weight * sum(month_deviation_penalties) +
             affinity_weight * sum(affinity_penalties) +
@@ -562,7 +563,7 @@ class CourseScheduler:
             utilization_weight * sum(trainer_utilization_penalties)
         )
 
-        # Initialize solver with increased time limit
+        # Initialize solver with customized parameters
         solver = cp_model.CpSolver()
         solver.parameters.max_time_in_seconds = solver_time_minutes * 60  # Convert to seconds
         solver.parameters.num_search_workers = num_workers
@@ -573,6 +574,7 @@ class CourseScheduler:
         elif solution_strategy == "FIND_FEASIBLE_FAST":
             solver.parameters.search_branching = cp_model.FIXED_SEARCH
             solver.parameters.optimize_with_core = False
+
         # Solve the model
         status = solver.Solve(model)
 
@@ -987,53 +989,17 @@ def main():
                     else:
                         st.error("Failed to create calendar")
 
-        st.header("3. Set Optimization Priorities")
+        Copy  # Add this before the "Optimize Schedule" button in your main function
+        st.header("3. Set Optimization Parameters")
 
-        # Create columns for the sliders
+        # Basic weights (as before)
         col1, col2 = st.columns(2)
-
         with col1:
-            monthly_weight = st.slider(
-                "Monthly Distribution Priority",
-                min_value=1,
-                max_value=10,
-                value=5,
-                help="Higher priority means closer adherence to monthly demand targets"
-            )
-
-            champion_weight = st.slider(
-                "Champion Assignment Priority",
-                min_value=1,
-                max_value=10,
-                value=4,
-                help="Higher priority means champions are more likely to teach their own courses"
-            )
-
+            monthly_weight = st.slider("Monthly Distribution Priority", 1, 10, 5)
+            champion_weight = st.slider("Champion Assignment Priority", 1, 10, 4)
         with col2:
-            utilization_weight = st.slider(
-                "Trainer Utilization Priority",
-                min_value=1,
-                max_value=10,
-                value=3,
-                help="Higher priority means trainers will have more balanced workloads"
-            )
-
-            affinity_weight = st.slider(
-                "Course Affinity Priority",
-                min_value=1,
-                max_value=10,
-                value=2,
-                help="Higher priority means better spacing between related courses"
-            )
-
-        # Utilization Target %
-        utilization_target = st.slider(
-            "Target Utilization Percentage",
-            min_value=50,
-            max_value=90,
-            value=70,
-            help="Target percentage of max workdays for trainers (higher = more work assigned)"
-        )
+            utilization_weight = st.slider("Trainer Utilization Priority", 1, 10, 3)
+            affinity_weight = st.slider("Course Affinity Priority", 1, 10, 2)
 
         # Advanced options in an expander
         with st.expander("Advanced Optimization Settings"):
@@ -1085,6 +1051,7 @@ def main():
         if st.session_state.scheduler.weekly_calendar is not None:
             st.header("5. Run Optimization")
 
+            # Then in the Optimize Schedule button handler, pass these parameters
             if st.button("Optimize Schedule"):
                 with st.spinner(f"Running optimization (maximum time: {solver_time} minutes)..."):
                     status, schedule_df, solver, schedule, trainer_assignments = st.session_state.scheduler.run_optimization(
