@@ -989,7 +989,7 @@ def main():
                     else:
                         st.error("Failed to create calendar")
 
-        Copy  # Add this before the "Optimize Schedule" button in your main function
+        # Add this before the "Optimize Schedule" button in your main function
         st.header("3. Set Optimization Parameters")
 
         # Basic weights (as before)
