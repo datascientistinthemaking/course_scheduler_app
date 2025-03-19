@@ -1478,27 +1478,33 @@ class CourseScheduler:
         heatmap_data = np.ones((len(courses), len(weeks)))
 
         # Fill in restricted weeks with 0s
+        # Modify this part too:
+        # Fill in restricted weeks with 0s
         for i, course in enumerate(courses):
             for j, week in enumerate(weeks):
-                # Check if this week is restricted due to working days
-                duration = self.course_run_data.loc[self.course_run_data["Course Name"] == course, "Duration"].iloc[0]
-                if self.weekly_working_days.get(week + 1, 0) < duration:
-                    heatmap_data[i, j] = 0
+                # Make sure we don't exceed the valid week range
+                week_num = week + 1
+                if week_num <= len(self.weekly_calendar):  # Add this check
+                    # Check if this week is restricted due to working days
+                    duration = self.course_run_data.loc[self.course_run_data["Course Name"] == course, "Duration"].iloc[
+                        0]
+                    if self.weekly_working_days.get(week_num, 0) < duration:
+                        heatmap_data[i, j] = 0
 
-                # Check week position restrictions
-                if course in self.week_restrictions:
-                    week_info = self.week_position_in_month.get(week + 1, {})
+                    # Check week position restrictions
+                    if course in self.week_restrictions:
+                        week_info = self.week_position_in_month.get(week_num, {})
 
-                    if week_info.get('is_first') and self.week_restrictions[course].get('First', False):
-                        heatmap_data[i, j] = 0
-                    elif week_info.get('is_second') and self.week_restrictions[course].get('Second', False):
-                        heatmap_data[i, j] = 0
-                    elif week_info.get('is_third') and self.week_restrictions[course].get('Third', False):
-                        heatmap_data[i, j] = 0
-                    elif week_info.get('is_fourth') and self.week_restrictions[course].get('Fourth', False):
-                        heatmap_data[i, j] = 0
-                    elif week_info.get('is_last') and self.week_restrictions[course].get('Last', False):
-                        heatmap_data[i, j] = 0
+                        if week_info.get('is_first') and self.week_restrictions[course].get('First', False):
+                            heatmap_data[i, j] = 0
+                        elif week_info.get('is_second') and self.week_restrictions[course].get('Second', False):
+                            heatmap_data[i, j] = 0
+                        elif week_info.get('is_third') and self.week_restrictions[course].get('Third', False):
+                            heatmap_data[i, j] = 0
+                        elif week_info.get('is_fourth') and self.week_restrictions[course].get('Fourth', False):
+                            heatmap_data[i, j] = 0
+                        elif week_info.get('is_last') and self.week_restrictions[course].get('Last', False):
+                            heatmap_data[i, j] = 0
 
         # Create heatmap
         course_week_heatmap = plt.figure(figsize=(18, 8))
@@ -1558,8 +1564,12 @@ class CourseScheduler:
         # Fill in unavailable weeks with 0s
         for i, trainer in enumerate(trainers):
             for j, week in enumerate(weeks):
-                if not self.is_trainer_available(trainer, week + 1):
-                    availability_data[i, j] = 0
+                # Make sure we don't exceed the length of weekly_calendar
+                week_num = week + 1
+                if week_num <= len(self.weekly_calendar):  # Add this check
+                    if not self.is_trainer_available(trainer, week_num):
+                        availability_data[i, j] = 0
+
 
         # Create heatmap
         sns.heatmap(availability_data, cmap=['red', 'green'], cbar=False,
