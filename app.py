@@ -1775,6 +1775,393 @@ class CourseScheduler:
             'summary_metrics': summary_fig
         }
 
+    def generate_trainer_calendar_visualization(self, schedule, trainer_assignments, solver):
+        """Generates a calendar visualization of trainer schedules, leaves, and holidays."""
+        import plotly.graph_objects as go
+        from datetime import datetime, timedelta
+        import pandas as pd
+        import numpy as np
+
+        def create_trainer_calendar(selected_trainers):
+            # Setup date range for the full year based on weekly_calendar
+            if not self.weekly_calendar or len(self.weekly_calendar) == 0:
+                return go.Figure().update_layout(
+                    title="Calendar not initialized. Please initialize the calendar first.")
+
+            start_date = self.weekly_calendar[0]
+            end_date = self.weekly_calendar[-1] + timedelta(days=6)  # End of the last week
+
+            # Create a list of all dates in the calendar
+            all_dates = []
+            current_date = start_date
+            while current_date <= end_date:
+                all_dates.append(current_date)
+                current_date += timedelta(days=1)
+
+            # Extract course assignments for the selected trainers
+            trainer_schedules = {}
+            for trainer_name in selected_trainers:
+                trainer_schedules[trainer_name] = []
+
+                # Process course assignments
+                for (course, methodology, language, run_index), trainer_var in trainer_assignments.items():
+                    trainer_idx = solver.Value(trainer_var)
+                    qualified_trainers = self.fleximatrix.get((course, language), [])
+
+                    if 0 <= trainer_idx < len(qualified_trainers):
+                        assigned_trainer = qualified_trainers[trainer_idx]
+
+                        if assigned_trainer == trainer_name:
+                            # Get the week number and course duration
+                            week_var = schedule.get((course, methodology, language, run_index))
+                            if week_var:
+                                week_num = solver.Value(week_var)
+                                duration = self.course_run_data.loc[
+                                    self.course_run_data["Course Name"] == course, "Duration"].iloc[0]
+
+                                # Calculate the start and end dates
+                                if 0 <= week_num - 1 < len(self.weekly_calendar):
+                                    week_start = self.weekly_calendar[week_num - 1]
+                                    # Courses typically run Monday-Friday
+                                    course_start = week_start
+                                    course_end = week_start + timedelta(days=duration - 1)
+
+                                    # Check if this is a champion course
+                                    is_champion = (self.course_champions.get((course, language)) == trainer_name)
+
+                                    trainer_schedules[trainer_name].append({
+                                        'type': 'course',
+                                        'course': course,
+                                        'language': language,
+                                        'run': run_index + 1,
+                                        'start_date': course_start,
+                                        'end_date': course_end,
+                                        'is_champion': is_champion
+                                    })
+
+            # Create a figure
+            fig = go.Figure()
+
+            # Calculate cell size and padding
+            num_trainers = len(selected_trainers)
+            day_height = 30  # Height of each day cell in pixels
+
+            # Calculate the number of weeks to display
+            num_weeks = (end_date - start_date).days // 7 + 1
+
+            # Create a grid of cells for the heatmap
+            for trainer_idx, trainer_name in enumerate(selected_trainers):
+                # Create x and y coordinates for this trainer's row
+                y_values = [trainer_idx] * len(all_dates)
+                x_values = list(range(len(all_dates)))
+
+                # Create a base heatmap for all days (white background)
+                fig.add_trace(go.Heatmap(
+                    z=[[0] * len(all_dates)],
+                    y=[trainer_idx],
+                    x=x_values,
+                    showscale=False,
+                    colorscale=[[0, 'white'], [1, 'white']],
+                    name=trainer_name,
+                    hoverinfo='none'
+                ))
+
+                # Add each course assignment as a colored rectangle
+                for assignment in trainer_schedules[trainer_name]:
+                    if assignment['type'] == 'course':
+                        start_idx = (assignment['start_date'] - start_date).days
+                        end_idx = (assignment['end_date'] - start_date).days
+
+                        for day_idx in range(start_idx, end_idx + 1):
+                            if 0 <= day_idx < len(all_dates):
+                                day_date = all_dates[day_idx]
+
+                                # Skip weekends (typically days 5 and 6 in a week)
+                                if day_date.weekday() < 5:  # Monday to Friday
+                                    # Determine color and pattern based on champion status
+                                    color = 'green'
+                                    pattern = None
+                                    if assignment['is_champion']:
+                                        pattern = {
+                                            'shape': '/',
+                                            'bgcolor': 'green',
+                                            'solidity': 0.5
+                                        }
+
+                                    # Add rectangle for this day
+                                    fig.add_shape(
+                                        type="rect",
+                                        x0=day_idx - 0.45,
+                                        y0=trainer_idx - 0.45,
+                                        x1=day_idx + 0.45,
+                                        y1=trainer_idx + 0.45,
+                                        fillcolor=color,
+                                        line=dict(width=0),
+                                        opacity=0.8,
+                                        layer="below"
+                                    )
+
+                                    # Add pattern for champion courses
+                                    if pattern:
+                                        fig.add_shape(
+                                            type="rect",
+                                            x0=day_idx - 0.45,
+                                            y0=trainer_idx - 0.45,
+                                            x1=day_idx + 0.45,
+                                            y1=trainer_idx + 0.45,
+                                            fillcolor="rgba(0,0,0,0)",
+                                            line=dict(width=0),
+                                            pattern=pattern,
+                                            opacity=0.8,
+                                            layer="below"
+                                        )
+
+                                    # Add hover text
+                                    fig.add_trace(go.Scatter(
+                                        x=[day_idx],
+                                        y=[trainer_idx],
+                                        mode='markers',
+                                        marker=dict(
+                                            size=10,
+                                            opacity=0
+                                        ),
+                                        hoverinfo='text',
+                                        hovertext=f"Course: {assignment['course']}<br>"
+                                                  f"Language: {assignment['language']}<br>"
+                                                  f"Run: {assignment['run']}<br>"
+                                                  f"Date: {day_date.strftime('%b %d, %Y')}<br>"
+                                                  f"{'Champion' if assignment['is_champion'] else ''}",
+                                        showlegend=False
+                                    ))
+
+                # Add annual leaves as dark grey rectangles
+                for _, leave in self.annual_leaves[self.annual_leaves["Name"] == trainer_name].iterrows():
+                    leave_start = max(leave["Start_Date"], start_date)
+                    leave_end = min(leave["End_Date"], end_date)
+
+                    # Skip if leave is outside our calendar range
+                    if leave_end < start_date or leave_start > end_date:
+                        continue
+
+                    start_idx = (leave_start - start_date).days
+                    end_idx = (leave_end - start_date).days
+
+                    for day_idx in range(start_idx, end_idx + 1):
+                        if 0 <= day_idx < len(all_dates):
+                            day_date = all_dates[day_idx]
+
+                            # Skip weekends to match working days
+                            if day_date.weekday() < 5:  # Monday to Friday
+                                fig.add_shape(
+                                    type="rect",
+                                    x0=day_idx - 0.45,
+                                    y0=trainer_idx - 0.45,
+                                    x1=day_idx + 0.45,
+                                    y1=trainer_idx + 0.45,
+                                    fillcolor="darkgrey",
+                                    line=dict(width=0),
+                                    opacity=0.8,
+                                    layer="below"
+                                )
+
+                                # Add hover text
+                                fig.add_trace(go.Scatter(
+                                    x=[day_idx],
+                                    y=[trainer_idx],
+                                    mode='markers',
+                                    marker=dict(
+                                        size=10,
+                                        opacity=0
+                                    ),
+                                    hoverinfo='text',
+                                    hovertext=f"Annual Leave<br>Date: {day_date.strftime('%b %d, %Y')}",
+                                    showlegend=False
+                                ))
+
+            # Add public holidays as dark blue rectangles (for all trainers)
+            for _, holiday in self.public_holidays_data.iterrows():
+                holiday_start = max(holiday["Start Date"], start_date)
+                holiday_end = min(holiday["End Date"], end_date)
+
+                # Skip if holiday is outside our calendar range
+                if holiday_end < start_date or holiday_start > end_date:
+                    continue
+
+                start_idx = (holiday_start - start_date).days
+                end_idx = (holiday_end - start_date).days
+
+                for day_idx in range(start_idx, end_idx + 1):
+                    if 0 <= day_idx < len(all_dates):
+                        day_date = all_dates[day_idx]
+
+                        # Skip weekends to match working days
+                        if day_date.weekday() < 5:  # Monday to Friday
+                            for trainer_idx in range(len(selected_trainers)):
+                                fig.add_shape(
+                                    type="rect",
+                                    x0=day_idx - 0.45,
+                                    y0=trainer_idx - 0.45,
+                                    x1=day_idx + 0.45,
+                                    y1=trainer_idx + 0.45,
+                                    fillcolor="darkblue",
+                                    line=dict(width=0),
+                                    opacity=0.8,
+                                    layer="below"
+                                )
+
+                                # Add hover text
+                                fig.add_trace(go.Scatter(
+                                    x=[day_idx],
+                                    y=[trainer_idx],
+                                    mode='markers',
+                                    marker=dict(
+                                        size=10,
+                                        opacity=0
+                                    ),
+                                    hoverinfo='text',
+                                    hovertext=f"Public Holiday<br>Date: {day_date.strftime('%b %d, %Y')}",
+                                    showlegend=False
+                                ))
+
+            # Add month separators and labels
+            month_markers = []
+            current_month = start_date.month
+            for i, date in enumerate(all_dates):
+                if date.month != current_month:
+                    month_markers.append(i)
+                    current_month = date.month
+
+            for idx in month_markers:
+                fig.add_shape(
+                    type="line",
+                    x0=idx - 0.5,
+                    y0=-0.5,
+                    x1=idx - 0.5,
+                    y1=len(selected_trainers) - 0.5,
+                    line=dict(
+                        color="black",
+                        width=2,
+                        dash="dash"
+                    )
+                )
+
+            # Add month labels at the top
+            month_labels = []
+            month_positions = []
+            current_month = None
+            month_start_idx = 0
+
+            for i, date in enumerate(all_dates):
+                if date.month != current_month:
+                    if current_month is not None:
+                        month_labels.append(all_dates[month_start_idx].strftime("%B"))
+                        month_positions.append((month_start_idx + i - 1) / 2)
+                    current_month = date.month
+                    month_start_idx = i
+
+            # Add the last month
+            month_labels.append(all_dates[month_start_idx].strftime("%B"))
+            month_positions.append((month_start_idx + len(all_dates) - 1) / 2)
+
+            # Add the month annotations
+            for label, pos in zip(month_labels, month_positions):
+                fig.add_annotation(
+                    x=pos,
+                    y=len(selected_trainers) + 0.7,
+                    text=label,
+                    showarrow=False,
+                    font=dict(size=14)
+                )
+
+            # Create a custom legend
+            legend_items = [
+                {"name": "Course Assignment", "color": "green", "pattern": None},
+                {"name": "Champion Course", "color": "green", "pattern": "hatch"},
+                {"name": "Annual Leave", "color": "darkgrey", "pattern": None},
+                {"name": "Public Holiday", "color": "darkblue", "pattern": None}
+            ]
+
+            # Place legend items at the bottom
+            for i, item in enumerate(legend_items):
+                # Add colored rectangle for the legend
+                fig.add_shape(
+                    type="rect",
+                    x0=i * 5,
+                    y0=-2,
+                    x1=i * 5 + 2,
+                    y1=-1,
+                    fillcolor=item["color"],
+                    line=dict(width=1, color="black"),
+                    opacity=0.8
+                )
+
+                # Add pattern if needed
+                if item["pattern"] == "hatch":
+                    fig.add_shape(
+                        type="rect",
+                        x0=i * 5,
+                        y0=-2,
+                        x1=i * 5 + 2,
+                        y1=-1,
+                        line=dict(width=0),
+                        fillcolor="rgba(0,0,0,0)",
+                        pattern={
+                            'shape': '/',
+                            'bgcolor': item["color"],
+                            'solidity': 0.5
+                        },
+                        opacity=0.8
+                    )
+
+                # Add text label
+                fig.add_annotation(
+                    x=i * 5 + 3.5,
+                    y=-1.5,
+                    text=item["name"],
+                    showarrow=False,
+                    xanchor="left"
+                )
+
+            # Update layout
+            week_ticks = []
+            week_labels = []
+
+            # Add ticks for each week
+            for i, week_start in enumerate(self.weekly_calendar):
+                week_idx = (week_start - start_date).days
+                if 0 <= week_idx < len(all_dates):
+                    week_ticks.append(week_idx)
+                    week_labels.append(f"W{i + 1}<br>{week_start.strftime('%d %b')}")
+
+            fig.update_layout(
+                title="Trainer Schedule Calendar",
+                autosize=True,
+                height=max(600, 100 + num_trainers * day_height),
+                width=max(1000, num_weeks * 30),
+                xaxis=dict(
+                    tickmode='array',
+                    tickvals=week_ticks,
+                    ticktext=week_labels,
+                    tickangle=90,
+                    title="Weeks"
+                ),
+                yaxis=dict(
+                    tickmode='array',
+                    tickvals=list(range(len(selected_trainers))),
+                    ticktext=selected_trainers,
+                    title="Trainers"
+                ),
+                margin=dict(t=50, l=100, r=50, b=200),
+                plot_bgcolor='white'
+            )
+
+
+            return fig
+
+        # The actual function will return a function that creates the visualization
+        # This allows Streamlit to generate it on demand with different trainer selections
+        return create_trainer_calendar
+
 # Create Streamlit application
 def main():
     try:
@@ -2193,6 +2580,65 @@ def main():
                                 st.error(f"Error generating visualizations: {str(e)}")
                                 st.info(
                                     "Try running a complete optimization first with the 'Optimize Schedule' button.")
+                        # Add this to your app.py file in the Results tab section,
+                        # under the result_tab4 (Visualizations) tab:
+
+                    st.subheader("Trainer Schedule Calendar")
+                    st.write("View trainers' schedules, leaves, and holidays throughout the year")
+
+                    # Check if we have optimization results
+                    if st.session_state.schedule_df is not None:
+                        try:
+                            # We need to get the schedule and trainer assignments from a quick optimization
+                            _, _, solver, schedule, trainer_assignments = st.session_state.scheduler.run_optimization(
+                                monthly_weight=5, champion_weight=4,
+                                utilization_weight=3, affinity_weight=2,
+                                utilization_target=70, solver_time_minutes=0.1,  # Very short time
+                                num_workers=8, min_course_spacing=2,
+                                solution_strategy="FIND_FEASIBLE_FAST",
+                                enforce_monthly_distribution=False
+                            )
+
+                            # Get list of all trainers
+                            all_trainers = list(st.session_state.scheduler.consultant_data["Name"])
+
+                            # Create multiselect dropdown for trainers
+                            selected_trainers = st.multiselect(
+                                "Select Trainers to Display",
+                                options=all_trainers,
+                                default=[all_trainers[0]] if all_trainers else []
+                            )
+
+                            if selected_trainers:
+                                # Get the visualization function
+                                create_calendar = st.session_state.scheduler.generate_trainer_calendar_visualization(
+                                    schedule, trainer_assignments, solver
+                                )
+
+                                # Generate the calendar based on selected trainers
+                                fig = create_calendar(selected_trainers)
+
+                                # Display the visualization
+                                st.plotly_chart(fig, use_container_width=True)
+
+                                st.info("""
+                                **Legend:**
+                                - **Green blocks**: Course assignments
+                                - **Green blocks with pattern**: Champion courses
+                                - **Dark grey blocks**: Annual leave
+                                - **Dark blue blocks**: Public holidays
+
+                                Hover over blocks to see details about courses, dates, etc.
+                                """)
+                            else:
+                                st.info("Please select at least one trainer to display their schedule.")
+
+                        except Exception as e:
+                            st.error(f"Error generating trainer calendar: {str(e)}")
+                            st.info(
+                                "Try running a complete optimization first with the 'Optimize Schedule' button.")
+                    else:
+                        st.info("Please run an optimization first to generate trainer schedules.")
 
                 # Export Results
                 st.markdown("### Export Results")
@@ -2222,6 +2668,10 @@ def main():
                         f"The last optimization run failed with status: {st.session_state.optimization_status}. Please adjust your parameters and try again.")
                 else:
                     st.info("Run the optimization in the 'Optimization Settings' tab to see results here.")
+
+
+
+
         with tab4:
             if st.session_state.scheduler.course_run_data is None:
                 st.info("Please load your data in the 'Data Input & Setup' tab first")
