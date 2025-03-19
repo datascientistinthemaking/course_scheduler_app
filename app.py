@@ -12,11 +12,6 @@ from ortools.sat.python import cp_model
 # Import template generator
 from template_generator import create_excel_template
 
-# Add template download button
-st.markdown("### Download Excel Template")
-st.write("Not sure about the format? Download our template file:")
-
-
 class CourseScheduler:
     def __init__(self):
         self.course_run_data = None
