@@ -1758,8 +1758,8 @@ def main():
     tab1, tab2, tab3, tab4 = st.tabs([
         "📤 Data Input & Setup",
         "⚙️ Optimization Settings",
-        "🔍 Debug & Analyze",
-        "📊 Results"
+        "📊 Results",
+        "🔍 Debug & Troubleshoot"
     ])
 
     with tab1:
