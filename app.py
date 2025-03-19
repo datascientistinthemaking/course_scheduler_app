@@ -583,6 +583,55 @@ class CourseScheduler:
                     for _ in range(penalty_weight):
                         trainer_utilization_penalties.append(under_target)
 
+        # NEW CODE: Add constraint to prevent trainers from teaching multiple courses in same week
+        print("Adding constraint: trainer can only teach one course per week")
+        # For each week in the calendar
+        for week in range(1, max_weeks + 1):
+            # For each trainer
+            for trainer_name in self.consultant_data["Name"]:
+                # Find all courses assigned to this trainer in this week
+                courses_in_week = []
+
+                # For each course run that might be scheduled this week
+                for (course, methodology, language, i), week_var in schedule.items():
+                    # Get trainer assignment variable
+                    trainer_var = trainer_assignments.get((course, methodology, language, i))
+                    if trainer_var is None:
+                        continue
+
+                    # Get the index of this trainer in the qualified trainers list
+                    qualified_trainers = self.fleximatrix.get((course, language), [])
+                    if trainer_name not in qualified_trainers:
+                        continue
+
+                    t_idx = qualified_trainers.index(trainer_name)
+
+                    # Create a boolean variable indicating if this course is assigned to this trainer in this week
+                    is_this_course = model.NewBoolVar(f"{course}_{i}_by_{trainer_name}_in_week_{week}")
+
+                    # This course is assigned to this trainer in this week if:
+                    # 1. It's scheduled in this week, AND
+                    # 2. This trainer is assigned to it
+                    is_scheduled_this_week = model.NewBoolVar(f"{course}_{i}_in_week_{week}")
+                    model.Add(week_var == week).OnlyEnforceIf(is_scheduled_this_week)
+                    model.Add(week_var != week).OnlyEnforceIf(is_scheduled_this_week.Not())
+
+                    is_assigned_this_trainer = model.NewBoolVar(f"{course}_{i}_assigned_to_{trainer_name}")
+                    model.Add(trainer_var == t_idx).OnlyEnforceIf(is_assigned_this_trainer)
+                    model.Add(trainer_var != t_idx).OnlyEnforceIf(is_assigned_this_trainer.Not())
+
+                    # Both conditions must be true for this course to be counted
+                    model.AddBoolAnd([is_scheduled_this_week, is_assigned_this_trainer]).OnlyEnforceIf(is_this_course)
+                    model.AddBoolOr([is_scheduled_this_week.Not(), is_assigned_this_trainer.Not()]).OnlyEnforceIf(
+                        is_this_course.Not())
+
+                    courses_in_week.append(is_this_course)
+
+                # If there are multiple courses that could be assigned to this trainer this week
+                if len(courses_in_week) > 1:
+                    # Constraint: trainer can teach at most one course per week
+                    model.Add(sum(courses_in_week) <= 1)
+
         # Combined objective function with dynamic weights
         model.Minimize(
             monthly_weight * sum(month_deviation_penalties) +
