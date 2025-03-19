@@ -1069,7 +1069,7 @@ class CourseScheduler:
             return "INFEASIBLE", diagnostics, None
 
     # Add to your Streamlit app:
-    if st.button("Diagnose with Incremental Constraints"):
+    if st.button("Diagnose with Incremental Constraints", key="incremental_constraints_btn"):
         with st.spinner("Running incremental constraint analysis..."):
             status, diagnostics, schedule_df = st.session_state.scheduler.run_incremental_optimization()
 
@@ -1549,46 +1549,7 @@ def main():
                 help="BALANCED = Default, MAXIMIZE_QUALITY = Best solution but slower, FIND_FEASIBLE_FAST = Any valid solution quickly"
             )
 
-        # Add this right before or after your "Optimize Schedule" button
-        if st.button("Diagnose with Incremental Constraints"):
-            with st.spinner("Running incremental constraint analysis..."):
-                status, diagnostics, schedule_df = st.session_state.scheduler.run_incremental_optimization()
 
-                # Display diagnostics in a table
-                st.subheader("Constraint Diagnosis")
-                diagnosis_df = pd.DataFrame(diagnostics)
-                st.table(diagnosis_df)
-
-                # Interpretation
-                st.subheader("Interpretation")
-
-                # Find the first step that became infeasible
-                infeasible_step = None
-                for step in diagnostics:
-                    if not step["feasible"]:
-                        infeasible_step = step["step"]
-                        break
-
-                if infeasible_step:
-                    st.error(f"The model becomes infeasible when adding: {infeasible_step}")
-
-                    if infeasible_step == "Course spacing constraints":
-                        st.info("Try reducing the minimum spacing between course runs.")
-                    elif infeasible_step == "Trainer availability constraints":
-                        st.info("There might be insufficient trainer availability. Check your trainer leave periods.")
-                    elif infeasible_step == "Week restriction constraints":
-                        st.info("Week restrictions are too limiting. Try removing some week restrictions.")
-                    elif infeasible_step == "Monthly distribution constraints":
-                        st.info(
-                            "Monthly distribution requirements cannot be satisfied. Try making this a soft constraint.")
-                else:
-                    st.success(
-                        "The model is feasible with all constraints! If you're still having issues with the full optimization, it might be due to complex interactions between constraints.")
-
-                # If we got a feasible schedule, show it
-                if schedule_df is not None:
-                    st.subheader("Feasible Schedule")
-                    st.dataframe(schedule_df)
 
         with st.expander("Constraint Management (For Infeasible Solutions)"):
             st.write("If you're getting INFEASIBLE results, try relaxing some constraints:")
