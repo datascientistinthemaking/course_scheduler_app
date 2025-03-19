@@ -1914,7 +1914,7 @@ def main():
                     utilization_target = st.slider(
                         "Target Utilization Percentage",
                         min_value=50,
-                        max_value=90,
+                        max_value=100,
                         value=70,
                         help="Target percentage of max workdays for trainers"
                     )
@@ -2040,33 +2040,58 @@ def main():
                     st.subheader("Visualizations")
 
                     # We need to rerun the plotting functions
+                    # Add this code to the Results tab (tab3) section of your app.py
+                    # Replace the existing visualization button code with this modified version
+
                     if st.button("Generate Visualizations", key="generate_viz_btn"):
                         with st.spinner("Generating visualizations..."):
-                            # Retrieve solver and schedule from the last run
-                            _, _, solver, schedule, trainer_assignments = st.session_state.scheduler.run_optimization(
-                                monthly_weight=5, champion_weight=4,
-                                utilization_weight=3, affinity_weight=2,
-                                utilization_target=70, solver_time_minutes=1,
-                                num_workers=8, min_course_spacing=2,
-                                solution_strategy="FIND_FEASIBLE_FAST",
-                                enforce_monthly_distribution=False
-                            )
+                            try:
+                                # Check if we already have optimization results
+                                if hasattr(st.session_state,
+                                           'optimization_status') and st.session_state.optimization_status in [
+                                    cp_model.OPTIMAL, cp_model.FEASIBLE]:
+                                    # Get the latest schedule and trainer data from session state
+                                    # Run a quick new optimization just to get solver state and schedule objects
+                                    _, _, solver, schedule, trainer_assignments = st.session_state.scheduler.run_optimization(
+                                        monthly_weight=5, champion_weight=4,
+                                        utilization_weight=3, affinity_weight=2,
+                                        utilization_target=70, solver_time_minutes=1,
+                                        num_workers=8, min_course_spacing=2,
+                                        solution_strategy="FIND_FEASIBLE_FAST",
+                                        enforce_monthly_distribution=False
+                                    )
 
-                            # Generate and display charts
-                            col1, col2 = st.columns(2)
+                                    # Safety check that schedule and solver are valid
+                                    if schedule and solver and len(schedule) > 0 and hasattr(solver, 'Value'):
+                                        # Generate and display charts
+                                        col1, col2 = st.columns(2)
 
-                            with col1:
-                                st.subheader("Weekly Course Distribution")
-                                fig1 = st.session_state.scheduler.plot_weekly_course_bar_chart(schedule, solver)
-                                st.pyplot(fig1)
+                                        with col1:
+                                            st.subheader("Weekly Course Distribution")
+                                            try:
+                                                fig1 = st.session_state.scheduler.plot_weekly_course_bar_chart(schedule,
+                                                                                                               solver)
+                                                st.pyplot(fig1)
+                                            except Exception as e:
+                                                st.error(f"Error generating weekly chart: {str(e)}")
 
-                            with col2:
-                                st.subheader("Trainer Workload")
-                                fig2 = st.session_state.scheduler.plot_trainer_workload_chart(schedule,
-                                                                                              trainer_assignments,
-                                                                                              solver)
-                                st.pyplot(fig2)
+                                        with col2:
+                                            st.subheader("Trainer Workload")
+                                            try:
+                                                fig2 = st.session_state.scheduler.plot_trainer_workload_chart(
+                                                    schedule, trainer_assignments, solver)
+                                                st.pyplot(fig2)
+                                            except Exception as e:
+                                                st.error(f"Error generating trainer chart: {str(e)}")
+                                    else:
+                                        st.error(
+                                            "Couldn't generate valid solver state. Please run a complete optimization first.")
+                                else:
+                                    st.error("Please run a successful optimization before generating visualizations.")
 
+                            except Exception as e:
+                                st.error(f"Error generating visualizations: {str(e)}")
+                                st.info("Try running a full optimization with the 'Optimize Schedule' button first.")
                 # Export Results
                 st.markdown("### Export Results")
                 st.write("Download your complete optimization results:")
