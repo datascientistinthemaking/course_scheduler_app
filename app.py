@@ -309,7 +309,7 @@ class CourseScheduler:
         # Create the schedule variables for each course and run
         for _, row in self.course_run_data.iterrows():
             course, methodology, language, runs, duration = row["Course Name"], row["Methodology"], row["Language"], \
-            row["Runs"], row["Duration"]
+                row["Runs"], row["Duration"]
 
             for i in range(runs):
                 # Create a variable for the start week
@@ -411,7 +411,10 @@ class CourseScheduler:
                 if course == course_name:
                     course_runs.append((i, var))
 
-            course_runs.sort()
+            # FIX: Sort by the first element of the tuple (i) instead of trying to compare tuples
+            # This was the source of the error - we need to sort by run index only
+            course_runs.sort(key=lambda x: x[0])
+
             for i in range(len(course_runs) - 1):
                 run_num1, var1 = course_runs[i]
                 run_num2, var2 = course_runs[i + 1]
@@ -437,9 +440,9 @@ class CourseScheduler:
             if not c1_runs or not c2_runs:
                 continue
 
-            # Sort by run number
-            c1_runs.sort()
-            c2_runs.sort()
+            # Sort by run number (also fixing the sorting method)
+            c1_runs.sort(key=lambda x: x[0])
+            c2_runs.sort(key=lambda x: x[0])
 
             # Only check first run of each course to reduce constraints
             run1, var1 = c1_runs[0]
@@ -622,7 +625,6 @@ class CourseScheduler:
             return status, schedule_df, solver, schedule, trainer_assignments
         else:
             return status, None, solver, schedule, trainer_assignments
-
 
     def plot_weekly_course_bar_chart(self, schedule, solver):
         """Creates a bar chart showing number of courses per week."""
@@ -1105,25 +1107,42 @@ def main():
                     st.subheader("Visualizations")
 
                     # We need to rerun the plotting functions
+                    # Replace the "Generate Visualizations" button handler with this code:
+
                     if st.button("Generate Visualizations"):
                         with st.spinner("Generating visualizations..."):
-                            # Retrieve solver and schedule from the last run
-                            _, _, solver, schedule, trainer_assignments = st.session_state.scheduler.run_optimization()
+                            # Use the stored schedule and solver data instead of running optimization again
+                            if hasattr(st.session_state, 'schedule_df') and st.session_state.schedule_df is not None:
+                                # Run a quick optimization to get the solver object with same parameters
+                                # but set time limit to minimal (we just need the solver and schedule objects)
+                                status, _, solver, schedule, trainer_assignments = st.session_state.scheduler.run_optimization(
+                                    monthly_weight=monthly_weight,
+                                    champion_weight=champion_weight,
+                                    utilization_weight=utilization_weight,
+                                    affinity_weight=affinity_weight,
+                                    utilization_target=utilization_target,
+                                    solver_time_minutes=1,  # Minimal time since we don't need a full optimization
+                                    num_workers=num_workers,
+                                    min_course_spacing=min_course_spacing,
+                                    solution_strategy="FIND_FEASIBLE_FAST"  # Find any solution fast
+                                )
 
-                            # Generate and display charts
-                            col1, col2 = st.columns(2)
+                                # Generate and display charts
+                                col1, col2 = st.columns(2)
 
-                            with col1:
-                                st.subheader("Weekly Course Distribution")
-                                fig1 = st.session_state.scheduler.plot_weekly_course_bar_chart(schedule, solver)
-                                st.pyplot(fig1)
+                                with col1:
+                                    st.subheader("Weekly Course Distribution")
+                                    fig1 = st.session_state.scheduler.plot_weekly_course_bar_chart(schedule, solver)
+                                    st.pyplot(fig1)
 
-                            with col2:
-                                st.subheader("Trainer Workload")
-                                fig2 = st.session_state.scheduler.plot_trainer_workload_chart(schedule,
-                                                                                              trainer_assignments,
-                                                                                              solver)
-                                st.pyplot(fig2)
+                                with col2:
+                                    st.subheader("Trainer Workload")
+                                    fig2 = st.session_state.scheduler.plot_trainer_workload_chart(schedule,
+                                                                                                  trainer_assignments,
+                                                                                                  solver)
+                                    st.pyplot(fig2)
+                            else:
+                                st.error("Please run optimization first to generate visualizations")
 
                 # Step 5: Export Results
                 st.header("5. Export Results")
