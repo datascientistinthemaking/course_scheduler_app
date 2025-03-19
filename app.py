@@ -259,8 +259,8 @@ class CourseScheduler:
                          utilization_target=70, solver_time_minutes=5,
                          num_workers=8, min_course_spacing=2,
                          solution_strategy="BALANCED",
-                         enforce_monthly_distribution=False):  # Add this parameter
-
+                         enforce_monthly_distribution=False,
+                         max_affinity_constraints=50):  # Add this parameter
 
         # Get total F2F runs
         total_f2f_runs = sum(self.course_run_data["Runs"])
@@ -453,7 +453,13 @@ class CourseScheduler:
 
         # CONSTRAINT 3: Add constraints for course affinities
         print(f"Adding affinity constraints for course pairs")
+        affinity_count = 0
         for _, row in self.affinity_matrix_data.iterrows():
+            # Limit the number of affinity constraints
+            if affinity_count >= max_affinity_constraints:
+                print(f"Limiting to {max_affinity_constraints} affinity constraints")
+                break
+
             c1, c2, gap_weeks = row["Course 1"], row["Course 2"], row["Gap Weeks"]
 
             c1_runs = []
@@ -469,7 +475,7 @@ class CourseScheduler:
             if not c1_runs or not c2_runs:
                 continue
 
-            # Sort by run number (also fixing the sorting method)
+            # Sort by run number
             c1_runs.sort(key=lambda x: x[0])
             c2_runs.sort(key=lambda x: x[0])
 
@@ -493,6 +499,8 @@ class CourseScheduler:
 
             affinity_penalties.append(too_close)
             print(f"  Added affinity constraint: {c1} and {c2} should be {gap_weeks} weeks apart")
+
+            affinity_count += 1  # Increment the counter
 
         # CONSTRAINT 4: Trainer-specific constraints
         print("Adding trainer assignment constraints")
@@ -1854,47 +1862,56 @@ def main():
                                 st.markdown('<div class="error-box">❌ Failed to create calendar</div>',
                                             unsafe_allow_html=True)
 
+        # In the "Optimization Settings" tab
         with tab2:
             if st.session_state.scheduler.course_run_data is None:
                 st.info("Please load your data in the 'Data Input & Setup' tab first")
             else:
-                st.markdown('<div class="section-header"><h2>2. Optimization Parameters</h2></div>', unsafe_allow_html=True)
+                st.markdown('<div class="section-header"><h2>2. Optimization Parameters</h2></div>',
+                            unsafe_allow_html=True)
 
-                col1, col2 = st.columns(2)
+                # Create a container with custom styling for the sliders
+                st.markdown("""
+                <style>
+                .slider-container {
+                    background-color: #f8f9fa;
+                    border-radius: 10px;
+                    padding: 20px;
+                    border: 1px solid #e9ecef;
+                    box-shadow: 0 4px 6px rgba(0, 0, 0, 0.05);
+                    margin-bottom: 20px;
+                }
+                .slider-header {
+                    font-size: 1.2rem;
+                    font-weight: 600;
+                    margin-bottom: 15px;
+                    color: #1E88E5;
+                    border-bottom: 1px solid #e9ecef;
+                    padding-bottom: 10px;
+                }
+                </style>
+                """, unsafe_allow_html=True)
+
+                # Create a two-column layout with sliders in the left column
+                col1, col2 = st.columns([1, 1])
 
                 with col1:
-                    st.markdown("### Priority Weights")
+                    # Priority Weight Sliders in a nice frame
+                    st.markdown('<div class="slider-container">', unsafe_allow_html=True)
+                    st.markdown('<div class="slider-header">Priority Weights</div>', unsafe_allow_html=True)
                     monthly_weight = st.slider("Monthly Distribution Priority", 1, 10, 5,
                                                help="Higher values enforce monthly targets more strictly")
                     champion_weight = st.slider("Champion Assignment Priority", 1, 10, 4,
                                                 help="Higher values prioritize assigning course champions")
-
-                with col2:
                     utilization_weight = st.slider("Trainer Utilization Priority", 1, 10, 3,
                                                    help="Higher values encourage higher trainer utilization")
                     affinity_weight = st.slider("Course Affinity Priority", 1, 10, 2,
                                                 help="Higher values enforce gaps between related courses")
+                    st.markdown('</div>', unsafe_allow_html=True)
 
-                # Constraint Management UI
-                st.markdown("### Constraint Management")
-                st.markdown("Use these settings to adjust constraints, especially if facing infeasibility:")
-
-                col1, col2 = st.columns(2)
-
-                with col1:
-                    enforce_monthly = st.checkbox(
-                        "Enforce Monthly Distribution as Hard Constraint",
-                        value=False,
-                        help="Uncheck to allow flexibility in monthly distribution (recommended for feasibility)"
-                    )
-
-                    enforce_champions = st.checkbox(
-                        "Prioritize Champion Trainers",
-                        value=True,
-                        help="Uncheck to allow any qualified trainer without champion priority"
-                    )
-
-                with col2:
+                    # Constraint Management sliders in a nice frame
+                    st.markdown('<div class="slider-container">', unsafe_allow_html=True)
+                    st.markdown('<div class="slider-header">Constraint Settings</div>', unsafe_allow_html=True)
                     min_course_spacing = st.slider(
                         "Minimum Weeks Between Course Runs",
                         min_value=1,
@@ -1902,7 +1919,6 @@ def main():
                         value=2,
                         help="Lower values allow courses to be scheduled closer together"
                     )
-
                     utilization_target = st.slider(
                         "Target Utilization Percentage",
                         min_value=50,
@@ -1910,9 +1926,36 @@ def main():
                         value=70,
                         help="Target percentage of max workdays for trainers"
                     )
+                    # Add a slider to limit affinity constraints
+                    max_affinity = st.slider(
+                        "Maximum Affinity Constraints",
+                        min_value=10,
+                        max_value=200,
+                        value=50,
+                        help="Limit the number of course affinity constraints to reduce memory usage"
+                    )
+                    st.markdown('</div>', unsafe_allow_html=True)
 
-                # Advanced Settings
-                with st.expander("Advanced Optimization Settings"):
+                with col2:
+                    # Checkboxes and other options
+                    st.markdown('<div class="slider-container">', unsafe_allow_html=True)
+                    st.markdown('<div class="slider-header">Optimization Strategy</div>', unsafe_allow_html=True)
+                    enforce_monthly = st.checkbox(
+                        "Enforce Monthly Distribution as Hard Constraint",
+                        value=False,
+                        help="Uncheck to allow flexibility in monthly distribution (recommended for feasibility)"
+                    )
+                    enforce_champions = st.checkbox(
+                        "Prioritize Champion Trainers",
+                        value=True,
+                        help="Uncheck to allow any qualified trainer without champion priority"
+                    )
+                    solution_strategy = st.selectbox(
+                        "Solution Strategy",
+                        options=["BALANCED", "MAXIMIZE_QUALITY", "FIND_FEASIBLE_FAST"],
+                        index=0,
+                        help="BALANCED = Default, MAXIMIZE_QUALITY = Best solution but slower, FIND_FEASIBLE_FAST = Any valid solution quickly"
+                    )
                     solver_time = st.slider(
                         "Solver Time Limit (minutes)",
                         min_value=1,
@@ -1920,7 +1963,6 @@ def main():
                         value=5,
                         help="Maximum time the optimizer will run before returning best solution found"
                     )
-
                     num_workers = st.slider(
                         "Number of Search Workers",
                         min_value=1,
@@ -1928,21 +1970,19 @@ def main():
                         value=8,
                         help="More workers can find solutions faster but use more CPU"
                     )
+                    st.markdown('</div>', unsafe_allow_html=True)
 
-                    solution_strategy = st.selectbox(
-                        "Solution Strategy",
-                        options=["BALANCED", "MAXIMIZE_QUALITY", "FIND_FEASIBLE_FAST"],
-                        index=0,
-                        help="BALANCED = Default, MAXIMIZE_QUALITY = Best solution but slower, FIND_FEASIBLE_FAST = Any valid solution quickly"
-                    )
-
+                    # Troubleshooting options
+                    st.markdown('<div class="slider-container">', unsafe_allow_html=True)
+                    st.markdown('<div class="slider-header">Troubleshooting</div>', unsafe_allow_html=True)
                     if st.button("Disable All Week Restrictions", key="disable_restrictions_btn"):
                         st.session_state.scheduler.week_restrictions = {}
                         st.markdown(
                             '<div class="success-box">✅ All week restrictions have been disabled for this optimization run</div>',
                             unsafe_allow_html=True)
+                    st.markdown('</div>', unsafe_allow_html=True)
 
-                # Run the optimization
+                # Run the optimization button at the bottom
                 if st.session_state.scheduler.weekly_calendar is not None:
                     st.markdown("### Run Optimization")
 
@@ -1958,32 +1998,11 @@ def main():
                                 num_workers=num_workers,
                                 min_course_spacing=min_course_spacing,
                                 solution_strategy=solution_strategy,
-                                enforce_monthly_distribution=enforce_monthly
+                                enforce_monthly_distribution=enforce_monthly,
+                                max_affinity_constraints=max_affinity  # Add this parameter
                             )
 
-                            st.session_state.optimization_status = status
-
-                            if status in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
-                                st.session_state.schedule_df = schedule_df
-
-                                # Generate validation reports
-                                st.session_state.validation_df = st.session_state.scheduler.generate_monthly_validation(
-                                    schedule, solver)
-                                st.session_state.utilization_df = st.session_state.scheduler.generate_trainer_utilization_report(
-                                    schedule, trainer_assignments, solver)
-
-                                st.markdown(
-                                    f'<div class="success-box">✅ Optimization completed successfully! Status: {solver.StatusName(status)}</div>',
-                                    unsafe_allow_html=True)
-                                st.markdown("View your results in the 'Results' tab!")
-                            else:
-                                st.markdown(
-                                    f'<div class="error-box">❌ Optimization failed. Status: {solver.StatusName(status)}</div>',
-                                    unsafe_allow_html=True)
-                                st.markdown("Try using the 'Debug & Analyze' tab to diagnose and fix constraints!")
-                else:
-                    st.warning("Please initialize the calendar before running optimization")
-
+                            # Rest of your optimization code...
         with tab3:
             if st.session_state.schedule_df is not None:
                 st.markdown('<div class="section-header"><h2>4. Optimization Results</h2></div>', unsafe_allow_html=True)
