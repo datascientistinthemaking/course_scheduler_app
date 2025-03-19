@@ -2,13 +2,12 @@ import pandas as pd
 import numpy as np
 import datetime
 import streamlit as st
-t.set_page_config(page_title="Course Scheduler", layout="wide")
+st.set_page_config(page_title="Course Scheduler", layout="wide")
 import io
 import matplotlib.pyplot as plt
 import seaborn as sns
 from ortools.sat.python import cp_model
 
-s
 
 # Import template generator
 from template_generator import create_excel_template
