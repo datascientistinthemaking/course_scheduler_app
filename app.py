@@ -1477,7 +1477,7 @@ def main():
             # Template generator section
             with st.expander("Not sure about the format? Download our template first", expanded=False):
                 st.write("Use this template as a starting point for your data:")
-                if st.button("Generate Template", key="gen_template_btn"):
+                if st.button("Generate Template", key="generate_template_button"):
                     template = create_excel_template()
                     st.download_button(
                         "Download Excel Template",
