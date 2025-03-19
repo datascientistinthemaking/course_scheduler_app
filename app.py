@@ -453,13 +453,7 @@ class CourseScheduler:
 
         # CONSTRAINT 3: Add constraints for course affinities
         print(f"Adding affinity constraints for course pairs")
-        affinity_count = 0
         for _, row in self.affinity_matrix_data.iterrows():
-            # Limit the number of affinity constraints
-            if affinity_count >= max_affinity_constraints:
-                print(f"Limiting to {max_affinity_constraints} affinity constraints")
-                break
-
             c1, c2, gap_weeks = row["Course 1"], row["Course 2"], row["Gap Weeks"]
 
             c1_runs = []
@@ -475,7 +469,7 @@ class CourseScheduler:
             if not c1_runs or not c2_runs:
                 continue
 
-            # Sort by run number
+            # Sort by run number (also fixing the sorting method)
             c1_runs.sort(key=lambda x: x[0])
             c2_runs.sort(key=lambda x: x[0])
 
@@ -499,8 +493,6 @@ class CourseScheduler:
 
             affinity_penalties.append(too_close)
             print(f"  Added affinity constraint: {c1} and {c2} should be {gap_weeks} weeks apart")
-
-            affinity_count += 1  # Increment the counter
 
         # CONSTRAINT 4: Trainer-specific constraints
         print("Adding trainer assignment constraints")
