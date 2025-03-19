@@ -15,14 +15,7 @@ from template_generator import create_excel_template
 # Add template download button
 st.markdown("### Download Excel Template")
 st.write("Not sure about the format? Download our template file:")
-if st.button("Generate Template"):
-    template = create_excel_template()
-    st.download_button(
-        "Download Excel Template",
-        data=template,
-        file_name="course_scheduler_template.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
+
 
 class CourseScheduler:
     def __init__(self):
