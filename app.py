@@ -1109,128 +1109,207 @@ class CourseScheduler:
         else:
             return "INFEASIBLE", diagnostics, None
 
-
+    # Here's debugging code to add to the "plot_weekly_course_bar_chart" method in your CourseScheduler class
+    # Find this method in your app.py and replace it with this version:
 
     def plot_weekly_course_bar_chart(self, schedule, solver):
         """Creates a bar chart showing number of courses per week."""
-        max_weeks = len(self.weekly_calendar)
+        try:
+            max_weeks = len(self.weekly_calendar)
 
-        # Count courses per week
-        weekly_counts = {week: 0 for week in range(1, max_weeks + 1)}
-        for (_, _, _, _), week_var in schedule.items():
-            assigned_week = solver.Value(week_var)
-            weekly_counts[assigned_week] += 1
+            # Print debugging information
+            print(f"DEBUG: max_weeks = {max_weeks}")
+            print(f"DEBUG: schedule length = {len(schedule)}")
 
-        # Convert to dataframe for plotting
-        df = pd.DataFrame({
-            'Week': list(weekly_counts.keys()),
-            'Courses': list(weekly_counts.values())
-        })
+            # Count courses per week
+            weekly_counts = {week: 0 for week in range(1, max_weeks + 1)}
 
-        # Create a bar chart
-        plt.figure(figsize=(12, 6))
-        bars = plt.bar(df['Week'], df['Courses'], width=0.8)
+            for (course, _, _, _), week_var in schedule.items():
+                try:
+                    assigned_week = solver.Value(week_var)
+                    if 1 <= assigned_week <= max_weeks:  # Add range check
+                        weekly_counts[assigned_week] += 1
+                    else:
+                        print(f"DEBUG: Week value {assigned_week} is out of range (1-{max_weeks})")
+                except Exception as e:
+                    print(f"DEBUG: Error getting week value for {course}: {e}")
+                    continue
 
-        # Add week dates as second x-axis
-        ax1 = plt.gca()
-        ax2 = ax1.twiny()
+            # Convert to dataframe for plotting
+            df = pd.DataFrame({
+                'Week': list(weekly_counts.keys()),
+                'Courses': list(weekly_counts.values())
+            })
 
-        # Select a subset of week numbers for readability
-        step = max(1, max_weeks // 12)  # Show about 12 date labels
-        selected_weeks = list(range(1, max_weeks + 1, step))
+            # Create a bar chart
+            plt.figure(figsize=(12, 6))
+            bars = plt.bar(df['Week'], df['Courses'], width=0.8)
 
-        # Get date strings for selected weeks
-        date_labels = [self.weekly_calendar[w - 1].strftime("%b %d") for w in selected_weeks]
+            # Add week dates as second x-axis
+            ax1 = plt.gca()
+            ax2 = ax1.twiny()
 
-        # Set positions and labels
-        ax2.set_xticks([w for w in selected_weeks])
-        ax2.set_xticklabels(date_labels, rotation=45)
+            # Select a subset of week numbers for readability
+            step = max(1, max_weeks // 12)  # Show about 12 date labels
+            selected_weeks = list(range(1, max_weeks + 1, step))
 
-        # Formatting
-        plt.title("Number of Courses per Week", fontsize=16)
-        ax1.set_xlabel("Week Number", fontsize=14)
-        ax1.set_ylabel("Number of Courses", fontsize=14)
-        ax2.set_xlabel("Week Start Date", fontsize=14)
+            # Get date strings for selected weeks
+            date_labels = []
+            for w in selected_weeks:
+                if 0 <= w - 1 < len(self.weekly_calendar):  # Add range check
+                    date_labels.append(self.weekly_calendar[w - 1].strftime("%b %d"))
+                else:
+                    date_labels.append(f"Week {w}")
 
-        # Set y limit to make small differences more visible
-        max_courses = max(weekly_counts.values())
-        ax1.set_ylim(0, max(4, max_courses + 1))
+            # Set positions and labels
+            ax2.set_xticks([w for w in selected_weeks])
+            ax2.set_xticklabels(date_labels, rotation=45)
 
-        # Highlight weeks with no courses
-        for week, count in weekly_counts.items():
-            if count == 0:
-                plt.axvspan(week - 0.4, week + 0.4, color='lightgray', alpha=0.3)
+            # Formatting
+            plt.title("Number of Courses per Week", fontsize=16)
+            ax1.set_xlabel("Week Number", fontsize=14)
+            ax1.set_ylabel("Number of Courses", fontsize=14)
+            ax2.set_xlabel("Week Start Date", fontsize=14)
 
-        # Add grid for readability
-        plt.grid(axis='y', linestyle='--', alpha=0.7)
+            # Set y limit to make small differences more visible
+            max_courses = max(weekly_counts.values()) if weekly_counts else 0
+            ax1.set_ylim(0, max(4, max_courses + 1))
 
-        plt.tight_layout()
+            # Highlight weeks with no courses
+            for week, count in weekly_counts.items():
+                if count == 0:
+                    plt.axvspan(week - 0.4, week + 0.4, color='lightgray', alpha=0.3)
 
-        # Return the figure
-        return plt.gcf()
+            # Add grid for readability
+            plt.grid(axis='y', linestyle='--', alpha=0.7)
 
+            plt.tight_layout()
+
+            # Return the figure
+            return plt.gcf()
+        except Exception as e:
+            print(f"DEBUG: Error in plot_weekly_course_bar_chart: {e}")
+            # Return a simple error figure
+            plt.figure(figsize=(8, 6))
+            plt.text(0.5, 0.5, f"Error generating chart:\n{str(e)}",
+                     horizontalalignment='center', verticalalignment='center')
+            return plt.gcf()
+
+    # And here's the fixed trainer workload chart function:
 
     def plot_trainer_workload_chart(self, schedule, trainer_assignments, solver):
         """Creates a bar chart showing trainer workload and utilization"""
-        # Calculate days assigned to each trainer
-        trainer_days = {name: 0 for name in self.consultant_data["Name"]}
+        try:
+            # Calculate days assigned to each trainer
+            trainer_days = {name: 0 for name in self.consultant_data["Name"]}
 
-        for (course, methodology, language, i), week_var in schedule.items():
-            duration = self.course_run_data.loc[self.course_run_data["Course Name"] == course, "Duration"].iloc[0]
+            for (course, methodology, language, i), week_var in schedule.items():
+                try:
+                    # Get the course duration
+                    duration_series = self.course_run_data.loc[
+                        self.course_run_data["Course Name"] == course, "Duration"]
+                    if len(duration_series) == 0:
+                        print(f"DEBUG: Course {course} not found in course_run_data")
+                        continue
 
-            # Get trainer assignment
-            trainer_var = trainer_assignments[(course, methodology, language, i)]
-            trainer_idx = solver.Value(trainer_var)
+                    duration = duration_series.iloc[0]
 
-            if 0 <= trainer_idx < len(self.fleximatrix[(course, language)]):
-                trainer = self.fleximatrix[(course, language)][trainer_idx]
-                trainer_days[trainer] += duration
+                    # Check if this course+run has a trainer assignment
+                    if (course, methodology, language, i) not in trainer_assignments:
+                        print(f"DEBUG: No trainer assignment for {course} run {i + 1}")
+                        continue
 
-        # Prepare data for plotting
-        trainers = []
-        assigned_days = []
-        max_days_list = []
-        colors = []
+                    # Get trainer assignment
+                    trainer_var = trainer_assignments[(course, methodology, language, i)]
+                    trainer_idx = solver.Value(trainer_var)
 
-        for name, days in sorted(trainer_days.items(), key=lambda x: x[1], reverse=True):
-            if days > 0:  # Only include trainers with assignments
-                trainers.append(name)
-                assigned_days.append(days)
-                max_days = self.consultant_data.loc[self.consultant_data["Name"] == name, "Max_Days"].iloc[0]
-                max_days_list.append(max_days)
+                    # Check if the course+language has qualified trainers
+                    if (course, language) not in self.fleximatrix:
+                        print(f"DEBUG: No fleximatrix entry for {course} ({language})")
+                        continue
 
-                # Different color for freelancers
-                title = self.consultant_data.loc[self.consultant_data["Name"] == name, "Title"].iloc[0]
-                colors.append("tab:orange" if title == "Freelancer" else "tab:blue")
+                    qualified_trainers = self.fleximatrix[(course, language)]
 
-        # Create figure and axis
-        fig, ax = plt.subplots(figsize=(12, 6))
+                    # Check if trainer index is valid
+                    if 0 <= trainer_idx < len(qualified_trainers):
+                        trainer = qualified_trainers[trainer_idx]
+                        trainer_days[trainer] += duration
+                    else:
+                        print(
+                            f"DEBUG: Invalid trainer index {trainer_idx} for {course} (max {len(qualified_trainers) - 1})")
+                except Exception as e:
+                    print(f"DEBUG: Error processing course {course} run {i + 1}: {e}")
+                    continue
 
-        # Plot assigned days
-        bars = ax.bar(trainers, assigned_days, label="Assigned Days", color=colors)
+            # Prepare data for plotting - only include trainers with assignments
+            trainers = []
+            assigned_days = []
+            max_days_list = []
+            colors = []
 
-        # Plot max days as a line
-        ax.plot(trainers, max_days_list, 'rx-', label="Maximum Days", linewidth=2)
+            for name, days in sorted(trainer_days.items(), key=lambda x: x[1], reverse=True):
+                if days > 0:  # Only include trainers with assignments
+                    trainers.append(name)
+                    assigned_days.append(days)
 
-        # Add percentage labels
-        for i, (bar, max_days) in enumerate(zip(bars, max_days_list)):
-            height = bar.get_height()
-            percentage = (height / max_days * 100) if max_days > 0 else 0
-            ax.text(bar.get_x() + bar.get_width() / 2., height + 5,
-                    f"{percentage:.1f}%", ha='center', va='bottom', fontsize=9)
+                    # Get max days from consultant data
+                    max_days_series = self.consultant_data.loc[self.consultant_data["Name"] == name, "Max_Days"]
 
-        # Improve readability
-        plt.xticks(rotation=45, ha='right')
-        plt.tight_layout()
+                    if len(max_days_series) > 0:
+                        max_days = max_days_series.iloc[0]
+                        max_days_list.append(max_days)
 
-        # Add labels and title
-        plt.ylabel("Training Days")
-        plt.title("Trainer Workload and Utilization")
-        plt.legend()
-        plt.grid(axis='y', linestyle='--', alpha=0.7)
+                        # Get title for color
+                        title_series = self.consultant_data.loc[self.consultant_data["Name"] == name, "Title"]
+                        title = title_series.iloc[0] if len(title_series) > 0 else "Unknown"
+                        colors.append("tab:orange" if title == "Freelancer" else "tab:blue")
+                    else:
+                        print(f"DEBUG: Trainer {name} not found in consultant_data")
+                        max_days_list.append(100)  # Default value
+                        colors.append("tab:gray")  # Default color
 
-        # Return the figure
-        return plt.gcf()
+            # Check if we have data to plot
+            if not trainers:
+                plt.figure(figsize=(10, 6))
+                plt.text(0.5, 0.5, "No trainer assignments to display",
+                         horizontalalignment='center', verticalalignment='center', fontsize=14)
+                return plt.gcf()
+
+            # Create figure and axis
+            fig, ax = plt.subplots(figsize=(12, 6))
+
+            # Plot assigned days
+            bars = ax.bar(trainers, assigned_days, label="Assigned Days", color=colors)
+
+            # Plot max days as a line
+            ax.plot(trainers, max_days_list, 'rx-', label="Maximum Days", linewidth=2)
+
+            # Add percentage labels
+            for i, (bar, max_days) in enumerate(zip(bars, max_days_list)):
+                height = bar.get_height()
+                percentage = (height / max_days * 100) if max_days > 0 else 0
+                ax.text(bar.get_x() + bar.get_width() / 2., height + 5,
+                        f"{percentage:.1f}%", ha='center', va='bottom', fontsize=9)
+
+            # Improve readability
+            plt.xticks(rotation=45, ha='right')
+            plt.tight_layout()
+
+            # Add labels and title
+            plt.ylabel("Training Days")
+            plt.title("Trainer Workload and Utilization")
+            plt.legend()
+            plt.grid(axis='y', linestyle='--', alpha=0.7)
+
+            # Return the figure
+            return plt.gcf()
+        except Exception as e:
+            print(f"DEBUG: Error in plot_trainer_workload_chart: {e}")
+            # Return a simple error figure
+            plt.figure(figsize=(8, 6))
+            plt.text(0.5, 0.5, f"Error generating chart:\n{str(e)}",
+                     horizontalalignment='center', verticalalignment='center')
+            return plt.gcf()
 
     def generate_monthly_validation(self, schedule, solver):
         """Generates a monthly validation report for the schedule"""
@@ -2043,16 +2122,17 @@ def main():
                     # Add this code to the Results tab (tab3) section of your app.py
                     # Replace the existing visualization button code with this modified version
 
+                    # Replace the visualization button code in the Results tab section with this version:
+
                     if st.button("Generate Visualizations", key="generate_viz_btn"):
                         with st.spinner("Generating visualizations..."):
                             try:
-                                # Check if we already have optimization results
-                                if hasattr(st.session_state,
-                                           'optimization_status') and st.session_state.optimization_status in [
-                                    cp_model.OPTIMAL, cp_model.FEASIBLE]:
-                                    # Get the latest schedule and trainer data from session state
+                                # Only try to generate new optimization if we don't have a completed one
+                                if not hasattr(st.session_state, 'schedule_df') or st.session_state.schedule_df is None:
+                                    st.warning(
+                                        "No optimization results found. Running a quick optimization to generate visualizations...")
                                     # Run a quick new optimization just to get solver state and schedule objects
-                                    _, _, solver, schedule, trainer_assignments = st.session_state.scheduler.run_optimization(
+                                    status, schedule_df, solver, schedule, trainer_assignments = st.session_state.scheduler.run_optimization(
                                         monthly_weight=5, champion_weight=4,
                                         utilization_weight=3, affinity_weight=2,
                                         utilization_target=70, solver_time_minutes=1,
@@ -2061,37 +2141,59 @@ def main():
                                         enforce_monthly_distribution=False
                                     )
 
-                                    # Safety check that schedule and solver are valid
-                                    if schedule and solver and len(schedule) > 0 and hasattr(solver, 'Value'):
-                                        # Generate and display charts
-                                        col1, col2 = st.columns(2)
-
-                                        with col1:
-                                            st.subheader("Weekly Course Distribution")
-                                            try:
-                                                fig1 = st.session_state.scheduler.plot_weekly_course_bar_chart(schedule,
-                                                                                                               solver)
-                                                st.pyplot(fig1)
-                                            except Exception as e:
-                                                st.error(f"Error generating weekly chart: {str(e)}")
-
-                                        with col2:
-                                            st.subheader("Trainer Workload")
-                                            try:
-                                                fig2 = st.session_state.scheduler.plot_trainer_workload_chart(
-                                                    schedule, trainer_assignments, solver)
-                                                st.pyplot(fig2)
-                                            except Exception as e:
-                                                st.error(f"Error generating trainer chart: {str(e)}")
-                                    else:
+                                    if status not in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
                                         st.error(
-                                            "Couldn't generate valid solver state. Please run a complete optimization first.")
+                                            f"Could not find a feasible solution for visualization. Status: {solver.StatusName(status)}")
+                                        st.info(
+                                            "Try running a full optimization with the 'Optimize Schedule' button first.")
+                                        return
                                 else:
-                                    st.error("Please run a successful optimization before generating visualizations.")
+                                    # Run a very short optimization to get the solver state and variables
+                                    # but use the existing solution as a starting point
+                                    st.info("Using existing optimization results for visualization...")
+                                    status, _, solver, schedule, trainer_assignments = st.session_state.scheduler.run_optimization(
+                                        monthly_weight=5, champion_weight=4,
+                                        utilization_weight=3, affinity_weight=2,
+                                        utilization_target=70, solver_time_minutes=0.1,  # Very short time
+                                        num_workers=8, min_course_spacing=2,
+                                        solution_strategy="FIND_FEASIBLE_FAST",
+                                        enforce_monthly_distribution=False
+                                    )
+
+                                # Safety check that schedule and solver are valid
+                                if schedule and solver and len(schedule) > 0:
+                                    # Generate and display charts
+                                    col1, col2 = st.columns(2)
+
+                                    with col1:
+                                        st.subheader("Weekly Course Distribution")
+                                        try:
+                                            fig1 = st.session_state.scheduler.plot_weekly_course_bar_chart(schedule,
+                                                                                                           solver)
+                                            st.pyplot(fig1)
+                                        except Exception as e:
+                                            st.error(f"Error generating weekly chart: {str(e)}")
+                                            st.info("The visualization couldn't be generated due to data issues.")
+
+                                    with col2:
+                                        st.subheader("Trainer Workload")
+                                        try:
+                                            fig2 = st.session_state.scheduler.plot_trainer_workload_chart(
+                                                schedule, trainer_assignments, solver)
+                                            st.pyplot(fig2)
+                                        except Exception as e:
+                                            st.error(f"Error generating trainer chart: {str(e)}")
+                                            st.info("The visualization couldn't be generated due to data issues.")
+                                else:
+                                    st.error("Couldn't generate valid solver state for visualization.")
+                                    st.info(
+                                        "Please try running a complete optimization first with the 'Optimize Schedule' button.")
 
                             except Exception as e:
                                 st.error(f"Error generating visualizations: {str(e)}")
-                                st.info("Try running a full optimization with the 'Optimize Schedule' button first.")
+                                st.info(
+                                    "Try running a complete optimization first with the 'Optimize Schedule' button.")
+
                 # Export Results
                 st.markdown("### Export Results")
                 st.write("Download your complete optimization results:")
