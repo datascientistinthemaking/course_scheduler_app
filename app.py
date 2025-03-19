@@ -1775,12 +1775,38 @@ class CourseScheduler:
             'summary_metrics': summary_fig
         }
 
+
     def generate_trainer_calendar_visualization(self, schedule, trainer_assignments, solver):
         """Generates a calendar visualization of trainer schedules, leaves, and holidays."""
         import plotly.graph_objects as go
         from datetime import datetime, timedelta
         import pandas as pd
         import numpy as np
+
+        # First, convert the solver variables to actual values
+        # This way we avoid trying to use LinearExpr instances as Booleans
+        resolved_schedule = {}
+        resolved_assignments = {}
+
+        # Convert schedule variables to concrete values
+        for (course, methodology, language, i), week_var in schedule.items():
+            try:
+                week_value = solver.Value(week_var)
+                resolved_schedule[(course, methodology, language, i)] = week_value
+            except Exception as e:
+                print(f"Error resolving week for {course} run {i + 1}: {e}")
+                # Skip this course if we can't resolve its week
+                continue
+
+        # Convert trainer assignment variables to concrete values
+        for (course, methodology, language, i), trainer_var in trainer_assignments.items():
+            try:
+                trainer_idx = solver.Value(trainer_var)
+                resolved_assignments[(course, methodology, language, i)] = trainer_idx
+            except Exception as e:
+                print(f"Error resolving trainer for {course} run {i + 1}: {e}")
+                # Skip this course if we can't resolve its trainer
+                continue
 
         def create_trainer_calendar(selected_trainers):
             # Setup date range for the full year based on weekly_calendar
@@ -1803,9 +1829,8 @@ class CourseScheduler:
             for trainer_name in selected_trainers:
                 trainer_schedules[trainer_name] = []
 
-                # Process course assignments
-                for (course, methodology, language, run_index), trainer_var in trainer_assignments.items():
-                    trainer_idx = solver.Value(trainer_var)
+                # Process course assignments using the resolved assignments
+                for (course, methodology, language, run_index), trainer_idx in resolved_assignments.items():
                     qualified_trainers = self.fleximatrix.get((course, language), [])
 
                     if 0 <= trainer_idx < len(qualified_trainers):
@@ -1813,32 +1838,37 @@ class CourseScheduler:
 
                         if assigned_trainer == trainer_name:
                             # Get the week number and course duration
-                            week_var = schedule.get((course, methodology, language, run_index))
-                            if week_var:
-                                week_num = solver.Value(week_var)
-                                duration = self.course_run_data.loc[
-                                    self.course_run_data["Course Name"] == course, "Duration"].iloc[0]
+                            week_num = resolved_schedule.get((course, methodology, language, run_index))
+                            if week_num and 1 <= week_num <= len(self.weekly_calendar):
+                                try:
+                                    duration = self.course_run_data.loc[
+                                        self.course_run_data["Course Name"] == course, "Duration"].iloc[0]
 
-                                # Calculate the start and end dates
-                                if 0 <= week_num - 1 < len(self.weekly_calendar):
-                                    week_start = self.weekly_calendar[week_num - 1]
-                                    # Courses typically run Monday-Friday
-                                    course_start = week_start
-                                    course_end = week_start + timedelta(days=duration - 1)
+                                    # Calculate the start and end dates
+                                    if 0 <= week_num - 1 < len(self.weekly_calendar):
+                                        week_start = self.weekly_calendar[week_num - 1]
+                                        # Courses typically run Monday-Friday
+                                        course_start = week_start
+                                        course_end = week_start + timedelta(days=duration - 1)
 
-                                    # Check if this is a champion course
-                                    is_champion = (self.course_champions.get((course, language)) == trainer_name)
+                                        # Check if this is a champion course
+                                        is_champion = (
+                                                    self.course_champions.get((course, language)) == trainer_name)
 
-                                    trainer_schedules[trainer_name].append({
-                                        'type': 'course',
-                                        'course': course,
-                                        'language': language,
-                                        'run': run_index + 1,
-                                        'start_date': course_start,
-                                        'end_date': course_end,
-                                        'is_champion': is_champion
-                                    })
+                                        trainer_schedules[trainer_name].append({
+                                            'type': 'course',
+                                            'course': course,
+                                            'language': language,
+                                            'run': run_index + 1,
+                                            'start_date': course_start,
+                                            'end_date': course_end,
+                                            'is_champion': is_champion
+                                        })
+                                except Exception as e:
+                                    print(f"Error processing duration for {course}: {e}")
+                                    continue
 
+            # Rest of the function remains the same...
             # Create a figure
             fig = go.Figure()
 
@@ -2154,7 +2184,6 @@ class CourseScheduler:
                 margin=dict(t=50, l=100, r=50, b=200),
                 plot_bgcolor='white'
             )
-
 
             return fig
 
