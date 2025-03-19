@@ -1775,6 +1775,7 @@ class CourseScheduler:
             'summary_metrics': summary_fig
         }
 
+    # Updated function that doesn't use the unsupported 'pattern' property
 
     def generate_trainer_calendar_visualization(self, schedule, trainer_assignments, solver):
         """Generates a calendar visualization of trainer schedules, leaves, and holidays."""
@@ -1852,8 +1853,7 @@ class CourseScheduler:
                                         course_end = week_start + timedelta(days=duration - 1)
 
                                         # Check if this is a champion course
-                                        is_champion = (
-                                                    self.course_champions.get((course, language)) == trainer_name)
+                                        is_champion = (self.course_champions.get((course, language)) == trainer_name)
 
                                         trainer_schedules[trainer_name].append({
                                             'type': 'course',
@@ -1868,7 +1868,6 @@ class CourseScheduler:
                                     print(f"Error processing duration for {course}: {e}")
                                     continue
 
-            # Rest of the function remains the same...
             # Create a figure
             fig = go.Figure()
 
@@ -1908,15 +1907,9 @@ class CourseScheduler:
 
                                 # Skip weekends (typically days 5 and 6 in a week)
                                 if day_date.weekday() < 5:  # Monday to Friday
-                                    # Determine color and pattern based on champion status
-                                    color = 'green'
-                                    pattern = None
-                                    if assignment['is_champion']:
-                                        pattern = {
-                                            'shape': '/',
-                                            'bgcolor': 'green',
-                                            'solidity': 0.5
-                                        }
+                                    # Determine color based on champion status
+                                    # Use a darker green for champion courses instead of pattern
+                                    color = 'darkgreen' if assignment['is_champion'] else 'green'
 
                                     # Add rectangle for this day
                                     fig.add_shape(
@@ -1931,19 +1924,17 @@ class CourseScheduler:
                                         layer="below"
                                     )
 
-                                    # Add pattern for champion courses
-                                    if pattern:
-                                        fig.add_shape(
-                                            type="rect",
-                                            x0=day_idx - 0.45,
-                                            y0=trainer_idx - 0.45,
-                                            x1=day_idx + 0.45,
-                                            y1=trainer_idx + 0.45,
-                                            fillcolor="rgba(0,0,0,0)",
-                                            line=dict(width=0),
-                                            pattern=pattern,
-                                            opacity=0.8,
-                                            layer="below"
+                                    # Add a small "C" text for champion courses instead of pattern
+                                    if assignment['is_champion']:
+                                        fig.add_annotation(
+                                            x=day_idx,
+                                            y=trainer_idx,
+                                            text="C",
+                                            showarrow=False,
+                                            font=dict(
+                                                color="white",
+                                                size=10
+                                            )
                                         )
 
                                     # Add hover text
@@ -2105,10 +2096,10 @@ class CourseScheduler:
 
             # Create a custom legend
             legend_items = [
-                {"name": "Course Assignment", "color": "green", "pattern": None},
-                {"name": "Champion Course", "color": "green", "pattern": "hatch"},
-                {"name": "Annual Leave", "color": "darkgrey", "pattern": None},
-                {"name": "Public Holiday", "color": "darkblue", "pattern": None}
+                {"name": "Course Assignment", "color": "green", "is_champion": False},
+                {"name": "Champion Course", "color": "darkgreen", "is_champion": True},
+                {"name": "Annual Leave", "color": "darkgrey", "is_champion": False},
+                {"name": "Public Holiday", "color": "darkblue", "is_champion": False}
             ]
 
             # Place legend items at the bottom
@@ -2125,22 +2116,17 @@ class CourseScheduler:
                     opacity=0.8
                 )
 
-                # Add pattern if needed
-                if item["pattern"] == "hatch":
-                    fig.add_shape(
-                        type="rect",
-                        x0=i * 5,
-                        y0=-2,
-                        x1=i * 5 + 2,
-                        y1=-1,
-                        line=dict(width=0),
-                        fillcolor="rgba(0,0,0,0)",
-                        pattern={
-                            'shape': '/',
-                            'bgcolor': item["color"],
-                            'solidity': 0.5
-                        },
-                        opacity=0.8
+                # Add "C" for champion course in the legend
+                if item["is_champion"]:
+                    fig.add_annotation(
+                        x=i * 5 + 1,
+                        y=-1.5,
+                        text="C",
+                        showarrow=False,
+                        font=dict(
+                            color="white",
+                            size=10
+                        )
                     )
 
                 # Add text label
@@ -2190,7 +2176,6 @@ class CourseScheduler:
         # The actual function will return a function that creates the visualization
         # This allows Streamlit to generate it on demand with different trainer selections
         return create_trainer_calendar
-
 # Create Streamlit application
 def main():
     try:
@@ -2653,12 +2638,13 @@ def main():
                                 st.info("""
                                 **Legend:**
                                 - **Green blocks**: Course assignments
-                                - **Green blocks with pattern**: Champion courses
+                                - **Dark green blocks with 'C'**: Champion courses
                                 - **Dark grey blocks**: Annual leave
                                 - **Dark blue blocks**: Public holidays
 
                                 Hover over blocks to see details about courses, dates, etc.
                                 """)
+
                             else:
                                 st.info("Please select at least one trainer to display their schedule.")
 
