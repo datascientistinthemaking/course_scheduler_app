@@ -1977,7 +1977,10 @@ def main():
                 # Run the optimization button at the bottom
                 if st.session_state.scheduler.weekly_calendar is not None:
                     st.markdown("### Run Optimization")
+                    # This is just the modified section for the "Run Optimization" button
+                    # in the Optimization Settings tab (tab2)
 
+                    # Find this section in app.py around line 1800-1850
                     if st.button("Optimize Schedule", key="optimize_schedule_btn"):
                         with st.spinner(f"Running optimization (maximum time: {solver_time} minutes)..."):
                             status, schedule_df, solver, schedule, trainer_assignments = st.session_state.scheduler.run_optimization(
@@ -1991,9 +1994,27 @@ def main():
                                 min_course_spacing=min_course_spacing,
                                 solution_strategy=solution_strategy,
                                 enforce_monthly_distribution=enforce_monthly,
-                                max_affinity_constraints=max_affinity  # Add this parameter
+                                max_affinity_constraints=max_affinity
                             )
 
+                            # Store the optimization status in session state
+                            st.session_state.optimization_status = status
+
+                            # Check if the optimization was successful
+                            if status in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
+                                # Store results in session state
+                                st.session_state.schedule_df = schedule_df
+
+                                # Generate the validation and utilization reports
+                                st.session_state.validation_df = st.session_state.scheduler.generate_monthly_validation(
+                                    schedule, solver)
+                                st.session_state.utilization_df = st.session_state.scheduler.generate_trainer_utilization_report(
+                                    schedule, trainer_assignments, solver)
+
+                                st.success("Optimization completed successfully! View results in the Results tab.")
+                            else:
+                                st.error(
+                                    f"Optimization failed with status: {solver.StatusName(status)}. Try adjusting your parameters or check the Debug tab.")
                             # Rest of your optimization code...
         with tab3:
             if st.session_state.schedule_df is not None:
