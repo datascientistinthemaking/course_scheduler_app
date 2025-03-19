@@ -1330,6 +1330,309 @@ class CourseScheduler:
         return output
 
 
+    def analyze_constraints_visually(self):
+        """Generate visual analysis of constraints to help identify sources of infeasibility"""
+        import matplotlib.pyplot as plt
+        import seaborn as sns
+        import numpy as np
+        from matplotlib.colors import LinearSegmentedColormap
+
+        # 1. Analyze monthly distribution vs. available weeks
+        months = range(1, 13)
+        total_f2f_runs = sum(self.course_run_data["Runs"])
+
+        # Calculate monthly demand
+        monthly_demand = {}
+        total_percentage = self.monthly_demand['Percentage'].sum()
+        for _, row in self.monthly_demand.iterrows():
+            month = row['Month']
+            percentage = row['Percentage'] / total_percentage
+            demand = round(percentage * total_f2f_runs)
+            monthly_demand[month] = demand
+
+        # Calculate available weeks per month
+        monthly_weeks = {}
+        for week, month in self.week_to_month_map.items():
+            if month not in monthly_weeks:
+                monthly_weeks[month] = 0
+            monthly_weeks[month] += 1
+
+        # Calculate available working days per month
+        monthly_working_days = {}
+        for week, month in self.week_to_month_map.items():
+            if month not in monthly_working_days:
+                monthly_working_days[month] = 0
+            monthly_working_days[month] += self.weekly_working_days.get(week, 0)
+
+        # Create dataframe for plotting
+        monthly_data = []
+        for month in range(1, 13):
+            monthly_data.append({
+                'Month': month,
+                'Demand': monthly_demand.get(month, 0),
+                'Weeks': monthly_weeks.get(month, 0),
+                'Working Days': monthly_working_days.get(month, 0)
+            })
+
+        monthly_df = pd.DataFrame(monthly_data)
+
+        # Calculate two metrics:
+        # 1. Courses per week: How many courses need to be scheduled per available week
+        # 2. Demand pressure: Percentage of working days required for courses
+        monthly_df['Courses per Week'] = monthly_df['Demand'] / monthly_df['Weeks'].replace(0, np.nan)
+
+        # Assuming each course takes 5 days on average
+        avg_course_days = self.course_run_data["Duration"].mean()
+        monthly_df['Demand Pressure (%)'] = (monthly_df['Demand'] * avg_course_days * 100) / monthly_df[
+            'Working Days'].replace(0, np.nan)
+
+        # Create figures
+        fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+
+        # Plot 1: Monthly Demand vs. Available Weeks
+        ax1 = axes[0, 0]
+        monthly_df.plot(x='Month', y=['Demand', 'Weeks'], kind='bar', ax=ax1)
+        ax1.set_title('Monthly Course Demand vs. Available Weeks')
+        ax1.set_xlabel('Month')
+        ax1.set_ylabel('Count')
+        ax1.axhline(y=monthly_df['Demand'].mean(), color='r', linestyle='--', label='Avg. Demand')
+        ax1.legend()
+
+        # Plot 2: Courses per Week
+        ax2 = axes[0, 1]
+        monthly_df.plot(x='Month', y='Courses per Week', kind='bar', ax=ax2, color='orange')
+        ax2.set_title('Courses per Available Week')
+        ax2.set_xlabel('Month')
+        ax2.set_ylabel('Courses per Week')
+        ax2.axhline(y=1, color='g', linestyle='--', label='1 Course/Week')
+        ax2.axhline(y=2, color='y', linestyle='--', label='2 Courses/Week')
+        ax2.axhline(y=3, color='r', linestyle='--', label='3 Courses/Week')
+        ax2.legend()
+
+        # Plot 3: Demand Pressure
+        ax3 = axes[1, 0]
+        bars = monthly_df.plot(x='Month', y='Demand Pressure (%)', kind='bar', ax=ax3, color='purple')
+        ax3.set_title('Monthly Demand Pressure (% of Working Days Required)')
+        ax3.set_xlabel('Month')
+        ax3.set_ylabel('Percentage of Working Days')
+        ax3.axhline(y=100, color='r', linestyle='--', label='100% (Full Capacity)')
+        ax3.axhline(y=80, color='y', linestyle='--', label='80% (Threshold)')
+
+        # Color code bars by severity
+        for i, p in enumerate(bars.patches):
+            pressure = monthly_df['Demand Pressure (%)'].iloc[i]
+            if np.isnan(pressure):
+                p.set_color('gray')
+            elif pressure > 100:
+                p.set_color('red')
+            elif pressure > 80:
+                p.set_color('orange')
+            elif pressure > 60:
+                p.set_color('yellow')
+            else:
+                p.set_color('green')
+
+        ax3.legend()
+
+        # Plot 4: Week Restrictions Analysis
+        ax4 = axes[1, 1]
+
+        # Count how many courses are restricted in each week position
+        restrictions = {'First': 0, 'Second': 0, 'Third': 0, 'Fourth': 0, 'Last': 0}
+
+        for course, course_restrictions in self.week_restrictions.items():
+            for position, is_restricted in course_restrictions.items():
+                if is_restricted:
+                    restrictions[position] += 1
+
+        # Calculate percentage of courses restricted
+        total_courses = len(set(self.course_run_data["Course Name"]))
+        restriction_percentages = {pos: (count * 100 / total_courses) if total_courses > 0 else 0
+                                   for pos, count in restrictions.items()}
+
+        # Create restriction dataframe
+        restriction_df = pd.DataFrame({
+            'Week Position': list(restriction_percentages.keys()),
+            'Percentage Restricted': list(restriction_percentages.values())
+        })
+
+        # Plot restriction percentages
+        restriction_df.plot(x='Week Position', y='Percentage Restricted', kind='bar', ax=ax4, color='teal')
+        ax4.set_title('Percentage of Courses with Week Restrictions')
+        ax4.set_xlabel('Week Position in Month')
+        ax4.set_ylabel('Percentage of Courses')
+        ax4.axhline(y=50, color='y', linestyle='--', label='50% Threshold')
+        ax4.legend()
+
+        # Adjust layout
+        plt.tight_layout()
+
+        # Create another figure for the heatmap of week restrictions
+        plt.figure(figsize=(12, 10))
+
+        # Create a matrix of week restrictions for heatmap
+        courses = list(set(self.course_run_data["Course Name"]))
+        weeks = list(range(1, len(self.weekly_calendar) + 1))
+
+        # Initialize matrix with 1s (allowed)
+        heatmap_data = np.ones((len(courses), len(weeks)))
+
+        # Fill in restricted weeks with 0s
+        for i, course in enumerate(courses):
+            for j, week in enumerate(weeks):
+                # Check if this week is restricted due to working days
+                duration = self.course_run_data.loc[self.course_run_data["Course Name"] == course, "Duration"].iloc[0]
+                if self.weekly_working_days.get(week + 1, 0) < duration:
+                    heatmap_data[i, j] = 0
+
+                # Check week position restrictions
+                if course in self.week_restrictions:
+                    week_info = self.week_position_in_month.get(week + 1, {})
+
+                    if week_info.get('is_first') and self.week_restrictions[course].get('First', False):
+                        heatmap_data[i, j] = 0
+                    elif week_info.get('is_second') and self.week_restrictions[course].get('Second', False):
+                        heatmap_data[i, j] = 0
+                    elif week_info.get('is_third') and self.week_restrictions[course].get('Third', False):
+                        heatmap_data[i, j] = 0
+                    elif week_info.get('is_fourth') and self.week_restrictions[course].get('Fourth', False):
+                        heatmap_data[i, j] = 0
+                    elif week_info.get('is_last') and self.week_restrictions[course].get('Last', False):
+                        heatmap_data[i, j] = 0
+
+        # Create heatmap
+        course_week_heatmap = plt.figure(figsize=(18, 8))
+        sns.heatmap(heatmap_data, cmap=['red', 'green'], cbar=False,
+                    xticklabels=[f"W{w + 1}" for w in range(len(weeks))],
+                    yticklabels=courses)
+        plt.title('Course-Week Availability Matrix (Green = Available, Red = Restricted)')
+        plt.xlabel('Week Number')
+        plt.ylabel('Course')
+        plt.tight_layout()
+
+        # Analysis of trainer qualifications
+        plt.figure(figsize=(10, 8))
+
+        # Count how many qualified trainers per course/language
+        course_lang_trainers = {}
+        for (course, language), trainers in self.fleximatrix.items():
+            course_lang_trainers[(course, language)] = len(trainers)
+
+        # Convert to DataFrame
+        trainers_df = pd.DataFrame([
+            {'Course': course, 'Language': lang, 'Qualified Trainers': count}
+            for (course, lang), count in course_lang_trainers.items()
+        ])
+
+        # Get runs per course/language
+        runs_df = self.course_run_data.groupby(['Course Name', 'Language'])['Runs'].sum().reset_index()
+        runs_df.columns = ['Course', 'Language', 'Runs']
+
+        # Merge trainers and runs
+        analysis_df = pd.merge(trainers_df, runs_df, on=['Course', 'Language'])
+
+        # Add trainers per run ratio
+        analysis_df['Trainers per Run'] = analysis_df['Qualified Trainers'] / analysis_df['Runs']
+
+        # Sort by trainers per run (ascending)
+        analysis_df = analysis_df.sort_values('Trainers per Run')
+
+        # Plot trainers per run
+        trainer_ratio_fig = plt.figure(figsize=(12, 6))
+        trainer_ratio_plot = sns.barplot(x='Course', y='Trainers per Run', data=analysis_df)
+        plt.title('Qualified Trainers per Course Run')
+        plt.xticks(rotation=90)
+        plt.axhline(y=1, color='r', linestyle='--', label='1:1 Ratio')
+        plt.axhline(y=2, color='y', linestyle='--', label='2:1 Ratio')
+        plt.tight_layout()
+
+        # Trainer availability heatmap
+        trainer_avail_fig = plt.figure(figsize=(18, 10))
+
+        # Create a matrix of trainer availability
+        trainers = list(self.consultant_data["Name"])
+
+        # Initialize matrix with 1s (available)
+        availability_data = np.ones((len(trainers), len(weeks)))
+
+        # Fill in unavailable weeks with 0s
+        for i, trainer in enumerate(trainers):
+            for j, week in enumerate(weeks):
+                if not self.is_trainer_available(trainer, week + 1):
+                    availability_data[i, j] = 0
+
+        # Create heatmap
+        sns.heatmap(availability_data, cmap=['red', 'green'], cbar=False,
+                    xticklabels=[f"W{w + 1}" for w in range(len(weeks))],
+                    yticklabels=trainers)
+        plt.title('Trainer Availability Matrix (Green = Available, Red = Unavailable)')
+        plt.xlabel('Week Number')
+        plt.ylabel('Trainer')
+        plt.tight_layout()
+
+        # Calculate Critical Metrics
+        total_runs = sum(self.course_run_data["Runs"])
+        total_available_weeks = sum(w > 0 for w in self.weekly_working_days.values())
+        total_available_days = sum(self.weekly_working_days.values())
+        total_course_days = sum(self.course_run_data["Runs"] * self.course_run_data["Duration"])
+
+        # Create a summary stats figure
+        summary_fig = plt.figure(figsize=(10, 6))
+
+        # Format as a table
+        cell_text = [
+            ["Total Course Runs", f"{total_runs}"],
+            ["Available Weeks", f"{total_available_weeks}"],
+            ["Available Working Days", f"{total_available_days}"],
+            ["Required Course Days", f"{total_course_days}"],
+            ["Overall Capacity Utilization",
+             f"{(total_course_days / total_available_days * 100) if total_available_days > 0 else 0:.1f}%"],
+            ["Runs per Available Week", f"{(total_runs / total_available_weeks) if total_available_weeks > 0 else 0:.2f}"]
+        ]
+
+        # Add color coding
+        cell_colors = [['lightgray', 'lightgray'] for _ in range(len(cell_text))]
+
+        # Highlight potential issues
+        capacity_pct = (total_course_days / total_available_days * 100) if total_available_days > 0 else 0
+        if capacity_pct > 90:
+            cell_colors[4][1] = 'lightcoral'
+        elif capacity_pct > 75:
+            cell_colors[4][1] = 'lightyellow'
+        else:
+            cell_colors[4][1] = 'lightgreen'
+
+        runs_per_week = (total_runs / total_available_weeks) if total_available_weeks > 0 else 0
+        if runs_per_week > 1.5:
+            cell_colors[5][1] = 'lightcoral'
+        elif runs_per_week > 1:
+            cell_colors[5][1] = 'lightyellow'
+        else:
+            cell_colors[5][1] = 'lightgreen'
+
+        # Create table
+        plt.axis('off')
+        summary_table = plt.table(cellText=cell_text, cellColours=cell_colors,
+                                  colLabels=["Metric", "Value"],
+                                  loc='center', cellLoc='center')
+
+        # Format table
+        summary_table.auto_set_font_size(False)
+        summary_table.set_fontsize(12)
+        summary_table.scale(1, 2)
+
+        plt.title('Overall Scheduling Feasibility Metrics', fontsize=16)
+        plt.tight_layout()
+
+        # Return all figures for Streamlit
+        return {
+            'monthly_analysis': fig,
+            'course_week_heatmap': course_week_heatmap,
+            'trainer_ratio_plot': trainer_ratio_fig,
+            'trainer_avail_heatmap': trainer_avail_fig,
+            'summary_metrics': summary_fig
+        }
+
 # Create Streamlit application
 def main():
 
