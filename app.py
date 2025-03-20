@@ -1,11 +1,8 @@
 import pandas as pd
-import numpy as np
 import datetime
 import streamlit as st
 st.set_page_config(page_title="Course Scheduler", layout="wide")
-import io
 import matplotlib.pyplot as plt
-import seaborn as sns
 from ortools.sat.python import cp_model
 import logging
 
@@ -260,7 +257,8 @@ class CourseScheduler:
                          num_workers=8, min_course_spacing=2,
                          solution_strategy="BALANCED",
                          enforce_monthly_distribution=False,
-                         max_affinity_constraints=50):  # Add this parameter
+                         max_affinity_constraints=50,
+                         prioritize_all_courses=False):  # Add this parameter
 
         # Get total F2F runs
         total_f2f_runs = sum(self.course_run_data["Runs"])
@@ -299,6 +297,7 @@ class CourseScheduler:
         affinity_penalties = []
         trainer_utilization_penalties = []
         champion_assignment_penalties = []
+        unscheduled_course_penalties = []  # New list for unscheduled course penalties
 
         # Create the schedule variables for each course and run
         for _, row in self.course_run_data.iterrows():
@@ -635,14 +634,94 @@ class CourseScheduler:
                 if len(week_assignments) > 1:
                     # Add constraint: at most one assignment per trainer per week
                     model.Add(sum(week_assignments) <= 1)
+        # If we're prioritizing all courses being scheduled, add variables to track this
+        if prioritize_all_courses:
+            print("Adding priority for scheduling all courses")
+            for (course, methodology, language, i), week_var in schedule.items():
+                # Create a boolean variable that tracks if this course is scheduled
+                is_scheduled = model.NewBoolVar(f"{course}_{i}_is_scheduled")
 
-        # Combined objective function with dynamic weights
-        model.Minimize(
-            monthly_weight * sum(month_deviation_penalties) +
-            affinity_weight * sum(affinity_penalties) +
-            champion_weight * sum(champion_assignment_penalties) +
-            utilization_weight * sum(trainer_utilization_penalties)
-        )
+                # Create constraints: is_scheduled is True iff week_var is assigned to a valid week
+                # First get all possible week values
+                all_valid_weeks = []
+                for w, days in self.weekly_working_days.items():
+                    duration = self.course_run_data.loc[self.course_run_data["Course Name"] == course, "Duration"].iloc[
+                        0]
+                    if days >= duration:
+                        # Check week restrictions
+                        if course in self.week_restrictions:
+                            week_info = self.week_position_in_month.get(w, {})
+                            skip_week = False
+
+                            if week_info.get('is_first') and self.week_restrictions[course].get('First', False):
+                                skip_week = True
+                            elif week_info.get('is_second') and self.week_restrictions[course].get('Second', False):
+                                skip_week = True
+                            elif week_info.get('is_third') and self.week_restrictions[course].get('Third', False):
+                                skip_week = True
+                            elif week_info.get('is_fourth') and self.week_restrictions[course].get('Fourth', False):
+                                skip_week = True
+                            elif week_info.get('is_last') and self.week_restrictions[course].get('Last', False):
+                                skip_week = True
+
+                            if skip_week:
+                                continue
+
+                        # Check if any trainer is available
+                        qualified_trainers = self.fleximatrix.get((course, language), [])
+                        for trainer in qualified_trainers:
+                            if self.is_trainer_available(trainer, w):
+                                all_valid_weeks.append(w)
+                                break
+
+                if all_valid_weeks:
+                    # Course is scheduled if week_var equals any valid week
+                    for w in all_valid_weeks:
+                        week_match = model.NewBoolVar(f"{course}_{i}_week_{w}")
+                        model.Add(week_var == w).OnlyEnforceIf(week_match)
+                        model.Add(week_var != w).OnlyEnforceIf(week_match.Not())
+
+                    model.AddBoolOr(
+                        [model.NewBoolVar(f"{course}_{i}_week_{w}") for w in all_valid_weeks]).OnlyEnforceIf(
+                        is_scheduled)
+
+                    # Add a heavy penalty for not scheduling this course
+                    not_scheduled = model.NewBoolVar(f"{course}_{i}_not_scheduled")
+                    model.AddBoolNot(is_scheduled).OnlyEnforceIf(not_scheduled)
+                    model.AddBoolNot(not_scheduled).OnlyEnforceIf(is_scheduled)
+
+                    # Add to penalty list (with high weight)
+                    unscheduled_course_penalties.append(not_scheduled)
+
+        # 4. Modify the objective function to include unscheduled course penalties
+        # Find the objective function (around line 835) and modify it:
+
+        # Calculate combined penalty weights
+
+        if prioritize_all_courses:
+            # If prioritizing all courses, use a very high weight for unscheduled courses
+            # and adjust other weights to allow more flexibility
+            unscheduled_weight = 20  # Very high weight to make this the top priority
+            monthly_weight = monthly_weight // 2 if enforce_monthly_distribution else monthly_weight
+            champion_weight = champion_weight // 2
+            min_course_spacing = max(1, min_course_spacing - 1)  # Reduce spacing requirements
+
+            # Combined objective function with course scheduling priority
+            model.Minimize(
+                unscheduled_weight * sum(unscheduled_course_penalties) +
+                monthly_weight * sum(month_deviation_penalties) +
+                affinity_weight * sum(affinity_penalties) +
+                champion_weight * sum(champion_assignment_penalties) +
+                utilization_weight * sum(trainer_utilization_penalties)
+            )
+        else:
+            # Original objective function
+            model.Minimize(
+                monthly_weight * sum(month_deviation_penalties) +
+                affinity_weight * sum(affinity_penalties) +
+                champion_weight * sum(champion_assignment_penalties) +
+                utilization_weight * sum(trainer_utilization_penalties)
+            )
 
         # Initialize solver with customized parameters
         solver = cp_model.CpSolver()
@@ -667,11 +746,33 @@ class CourseScheduler:
         print("Final Weekly Course Schedule with Trainers:")
         if status in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
             schedule_results = []
+            unscheduled_courses = []  # Track unscheduled courses
+            total_courses = 0
+            scheduled_courses = 0
 
             for (course, methodology, language, i), week_var in schedule.items():
+                total_courses += 1
                 assigned_week = solver.Value(week_var)
                 start_date = self.weekly_calendar[assigned_week - 1].strftime("%Y-%m-%d")
+                if assigned_week > 0:  # Course was scheduled
+                    scheduled_courses += 1
+                    start_date = self.weekly_calendar[assigned_week - 1].strftime("%Y-%m-%d")
 
+                    # Get trainer assignment (rest of original code)
+                    # ...
+
+                else:  # Course wasn't scheduled
+                    unscheduled_courses.append({
+                        "Course": course,
+                        "Methodology": methodology,
+                        "Language": language,
+                        "Run": i + 1
+                    })
+                # If there were unscheduled courses and we were trying to prioritize all courses
+                if prioritize_all_courses and unscheduled_courses:
+                    print(f"WARNING: {len(unscheduled_courses)} courses could not be scheduled:")
+                    for course in unscheduled_courses:
+                        print(f"  - {course['Course']} (Run {course['Run']})")
                 # Get trainer assignment
                 if (course, methodology, language, i) in trainer_assignments:
                     trainer_var = trainer_assignments[(course, methodology, language, i)]
@@ -700,9 +801,9 @@ class CourseScheduler:
             # Sort by week first, then by course name
             schedule_df = schedule_df.sort_values(by=["Week", "Course"])
 
-            return status, schedule_df, solver, schedule, trainer_assignments
+            return status, schedule_df, solver, schedule, trainer_assignments, unscheduled_courses
         else:
-            return status, None, solver, schedule, trainer_assignments
+            return status, None, solver, schedule, trainer_assignments, []
 
     def run_incremental_optimization(self, solver_time_minutes=5):
         """Run optimization by incrementally adding constraints to diagnose issues"""
@@ -2176,6 +2277,92 @@ class CourseScheduler:
         # The actual function will return a function that creates the visualization
         # This allows Streamlit to generate it on demand with different trainer selections
         return create_trainer_calendar
+
+    # Add this method to the CourseScheduler class
+    def analyze_unscheduled_course(self, course, language, run):
+        """Analyze why a specific course couldn't be scheduled"""
+        analysis = {}
+
+        # 1. Check trainer qualification
+        qualified_trainers = self.fleximatrix.get((course, language), [])
+        analysis["qualified_trainers"] = len(qualified_trainers)
+
+        if qualified_trainers:
+            # 2. Check course duration
+            duration = self.course_run_data.loc[self.course_run_data["Course Name"] == course, "Duration"].iloc[0]
+            analysis["duration"] = duration
+
+            # 3. Check valid weeks (accounting for working days)
+            valid_weeks = []
+            for w, days in self.weekly_working_days.items():
+                if days >= duration:
+                    valid_weeks.append(w)
+            analysis["weeks_with_enough_days"] = len(valid_weeks)
+
+            # 4. Check week restrictions
+            if course in self.week_restrictions:
+                restricted_positions = []
+                for position, is_restricted in self.week_restrictions[course].items():
+                    if is_restricted:
+                        restricted_positions.append(position)
+                analysis["restricted_week_positions"] = restricted_positions
+
+                # Calculate impact of restrictions
+                restricted_weeks = 0
+                for w in valid_weeks:
+                    week_info = self.week_position_in_month.get(w, {})
+                    if (week_info.get('is_first') and 'First' in restricted_positions) or \
+                            (week_info.get('is_second') and 'Second' in restricted_positions) or \
+                            (week_info.get('is_third') and 'Third' in restricted_positions) or \
+                            (week_info.get('is_fourth') and 'Fourth' in restricted_positions) or \
+                            (week_info.get('is_last') and 'Last' in restricted_positions):
+                        restricted_weeks += 1
+
+                analysis["weeks_restricted"] = restricted_weeks
+                analysis["weeks_available_after_restrictions"] = len(valid_weeks) - restricted_weeks
+            else:
+                analysis["restricted_week_positions"] = []
+                analysis["weeks_restricted"] = 0
+                analysis["weeks_available_after_restrictions"] = len(valid_weeks)
+
+            # 5. Check trainer availability in valid weeks
+            available_weeks = {}
+            for trainer in qualified_trainers:
+                available_weeks[trainer] = []
+                for w in valid_weeks:
+                    # Skip weeks with restrictions
+                    if course in self.week_restrictions:
+                        week_info = self.week_position_in_month.get(w, {})
+                        skip_week = False
+                        for position in restricted_positions:
+                            if position == 'First' and week_info.get('is_first'):
+                                skip_week = True
+                            elif position == 'Second' and week_info.get('is_second'):
+                                skip_week = True
+                            elif position == 'Third' and week_info.get('is_third'):
+                                skip_week = True
+                            elif position == 'Fourth' and week_info.get('is_fourth'):
+                                skip_week = True
+                            elif position == 'Last' and week_info.get('is_last'):
+                                skip_week = True
+                        if skip_week:
+                            continue
+
+                    if self.is_trainer_available(trainer, w):
+                        available_weeks[trainer].append(w)
+
+            # Count how many trainers are available for each week
+            weeks_with_trainers = {}
+            for w in valid_weeks:
+                weeks_with_trainers[w] = sum(1 for trainer, weeks in available_weeks.items() if w in weeks)
+
+            analysis["trainer_availability"] = available_weeks
+            analysis["weeks_with_trainers"] = weeks_with_trainers
+            analysis["weeks_with_any_trainer"] = sum(1 for count in weeks_with_trainers.values() if count > 0)
+
+        return analysis
+
+
 # Create Streamlit application
 def main():
     try:
@@ -2422,6 +2609,13 @@ def main():
                         value=True,
                         help="Uncheck to allow any qualified trainer without champion priority"
                     )
+
+                    prioritize_all_courses = st.checkbox(
+                        "Prioritize scheduling all courses",
+                        value=False,
+                        help="When enabled, the optimizer will prioritize scheduling all courses, potentially at the expense of other goals"
+                    )
+
                     solution_strategy = st.selectbox(
                         "Solution Strategy",
                         options=["BALANCED", "MAXIMIZE_QUALITY", "FIND_FEASIBLE_FAST"],
@@ -2444,6 +2638,9 @@ def main():
                     )
                     st.markdown('</div>', unsafe_allow_html=True)
 
+
+
+
                     # Troubleshooting options
                     st.markdown('<div class="slider-container">', unsafe_allow_html=True)
                     st.markdown('<div class="slider-header">Troubleshooting</div>', unsafe_allow_html=True)
@@ -2463,7 +2660,7 @@ def main():
                     # Find this section in app.py around line 1800-1850
                     if st.button("Optimize Schedule", key="optimize_schedule_btn"):
                         with st.spinner(f"Running optimization (maximum time: {solver_time} minutes)..."):
-                            status, schedule_df, solver, schedule, trainer_assignments = st.session_state.scheduler.run_optimization(
+                            status, schedule_df, solver, schedule, trainer_assignments, unscheduled_courses = st.session_state.scheduler.run_optimization(
                                 monthly_weight=monthly_weight,
                                 champion_weight=0 if not enforce_champions else champion_weight,
                                 utilization_weight=utilization_weight,
@@ -2474,11 +2671,13 @@ def main():
                                 min_course_spacing=min_course_spacing,
                                 solution_strategy=solution_strategy,
                                 enforce_monthly_distribution=enforce_monthly,
-                                max_affinity_constraints=max_affinity
+                                max_affinity_constraints=max_affinity,
+                                prioritize_all_courses=prioritize_all_courses  # Add this parameter
                             )
 
                             # Store the optimization status in session state
                             st.session_state.optimization_status = status
+                            st.session_state.unscheduled_courses = unscheduled_courses
 
                             # Check if the optimization was successful
                             if status in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
@@ -2491,11 +2690,16 @@ def main():
                                 st.session_state.utilization_df = st.session_state.scheduler.generate_trainer_utilization_report(
                                     schedule, trainer_assignments, solver)
 
-                                st.success("Optimization completed successfully! View results in the Results tab.")
+                                # Display success message with unscheduled course info
+                                if unscheduled_courses:
+                                    st.warning(
+                                        f"Optimization completed with {len(unscheduled_courses)} unscheduled courses. See Results tab for details.")
+                                else:
+                                    st.success("Optimization completed successfully! All courses were scheduled.")
                             else:
                                 st.error(
                                     f"Optimization failed with status: {solver.StatusName(status)}. Try adjusting your parameters or check the Debug tab.")
-                            # Rest of your optimization code...
+
         with tab3:
             if st.session_state.schedule_df is not None:
                 st.markdown('<div class="section-header"><h2>4. Optimization Results</h2></div>', unsafe_allow_html=True)
@@ -2525,6 +2729,9 @@ def main():
 
                     # Replace the visualization button code in the Results tab section with this version:
 
+                    # Update the Generate Visualizations button to include unscheduled_courses in the returned values
+                    # Find this in the result_tab4 (Visualizations) tab
+
                     if st.button("Generate Visualizations", key="generate_viz_btn"):
                         with st.spinner("Generating visualizations..."):
                             try:
@@ -2533,13 +2740,14 @@ def main():
                                     st.warning(
                                         "No optimization results found. Running a quick optimization to generate visualizations...")
                                     # Run a quick new optimization just to get solver state and schedule objects
-                                    status, schedule_df, solver, schedule, trainer_assignments = st.session_state.scheduler.run_optimization(
+                                    status, schedule_df, solver, schedule, trainer_assignments, _ = st.session_state.scheduler.run_optimization(
                                         monthly_weight=5, champion_weight=4,
                                         utilization_weight=3, affinity_weight=2,
                                         utilization_target=70, solver_time_minutes=1,
                                         num_workers=8, min_course_spacing=2,
                                         solution_strategy="FIND_FEASIBLE_FAST",
-                                        enforce_monthly_distribution=False
+                                        enforce_monthly_distribution=False,
+                                        prioritize_all_courses=False
                                     )
 
                                     if status not in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
@@ -2552,14 +2760,17 @@ def main():
                                     # Run a very short optimization to get the solver state and variables
                                     # but use the existing solution as a starting point
                                     st.info("Using existing optimization results for visualization...")
-                                    status, _, solver, schedule, trainer_assignments = st.session_state.scheduler.run_optimization(
+                                    status, _, solver, schedule, trainer_assignments, _ = st.session_state.scheduler.run_optimization(
                                         monthly_weight=5, champion_weight=4,
                                         utilization_weight=3, affinity_weight=2,
                                         utilization_target=70, solver_time_minutes=0.1,  # Very short time
                                         num_workers=8, min_course_spacing=2,
                                         solution_strategy="FIND_FEASIBLE_FAST",
-                                        enforce_monthly_distribution=False
+                                        enforce_monthly_distribution=False,
+                                        prioritize_all_courses=False
                                     )
+
+                                # Rest of the visualization code stays the same...
 
                                 # Safety check that schedule and solver are valid
                                 if schedule and solver and len(schedule) > 0:
@@ -2601,16 +2812,18 @@ def main():
                     st.write("View trainers' schedules, leaves, and holidays throughout the year")
 
                     # Check if we have optimization results
+                    # Check if we have optimization results
                     if st.session_state.schedule_df is not None:
                         try:
                             # We need to get the schedule and trainer assignments from a quick optimization
-                            _, _, solver, schedule, trainer_assignments = st.session_state.scheduler.run_optimization(
+                            _, _, solver, schedule, trainer_assignments, _ = st.session_state.scheduler.run_optimization(
                                 monthly_weight=5, champion_weight=4,
                                 utilization_weight=3, affinity_weight=2,
                                 utilization_target=70, solver_time_minutes=0.1,  # Very short time
                                 num_workers=8, min_course_spacing=2,
                                 solution_strategy="FIND_FEASIBLE_FAST",
-                                enforce_monthly_distribution=False
+                                enforce_monthly_distribution=False,
+                                prioritize_all_courses=False  # Add this parameter
                             )
 
                             # Get list of all trainers
@@ -2684,7 +2897,33 @@ def main():
                 else:
                     st.info("Run the optimization in the 'Optimization Settings' tab to see results here.")
 
+                # Add this code to the Results tab section (tab3)
+                # After loading and displaying the schedule dataframe
 
+                # Store unscheduled courses in session state
+                if 'unscheduled_courses' not in st.session_state:
+                    st.session_state.unscheduled_courses = []
+
+                # In the run_optimization method, after creating schedule_df, add:
+                # Store the unscheduled courses in session state
+                st.session_state.unscheduled_courses = unscheduled_courses if unscheduled_courses else []
+
+                # In the results tab, after displaying the schedule dataframe:
+                if hasattr(st.session_state, 'unscheduled_courses') and st.session_state.unscheduled_courses:
+                    st.warning(f"{len(st.session_state.unscheduled_courses)} courses could not be scheduled")
+                    with st.expander("View Unscheduled Courses"):
+                        unscheduled_df = pd.DataFrame(st.session_state.unscheduled_courses)
+                        st.dataframe(unscheduled_df, use_container_width=True)
+
+                        st.info("""
+                        **Why couldn't these courses be scheduled?**
+                        - Insufficient qualified trainers
+                        - Trainer availability constraints
+                        - Week restrictions limiting valid weeks
+                        - Spacing requirements between course runs
+
+                        Try enabling "Prioritize scheduling all courses" in the Optimization Settings tab or relaxing some constraints.
+                        """)
 
 
         with tab4:
@@ -2777,6 +3016,226 @@ def main():
                             st.info(
                                 "Red areas in the heatmaps indicate restrictions or unavailability that could be causing infeasibility.")
 
+            # Replace the function definition:
+            def display_scheduling_problem_analysis():
+                st.subheader("Analyze Unscheduled Course")
+
+                if hasattr(st.session_state, 'unscheduled_courses') and st.session_state.unscheduled_courses:
+                    # Create dropdown to select unscheduled course
+                    course_options = [f"{c['Course']} (Run {c['Run']}, {c['Language']})" for c in
+                                      st.session_state.unscheduled_courses]
+                    selected_course = st.selectbox("Select course to analyze", course_options)
+
+                    if selected_course:
+                        # Extract course details from selection
+                        idx = course_options.index(selected_course)
+                        course_info = st.session_state.unscheduled_courses[idx]
+
+                        # Run analysis
+                        analysis = st.session_state.scheduler.analyze_unscheduled_course(
+                            course_info['Course'], course_info['Language'], course_info['Run'])
+
+                        # Display results
+                        col1, col2 = st.columns(2)
+
+                        with col1:
+                            st.markdown("### Course Information")
+                            st.markdown(f"**Course**: {course_info['Course']}")
+                            st.markdown(f"**Language**: {course_info['Language']}")
+                            st.markdown(f"**Run**: {course_info['Run']}")
+                            st.markdown(f"**Qualified Trainers**: {analysis['qualified_trainers']}")
+                            st.markdown(f"**Course Duration**: {analysis['duration']} days")
+
+                            if analysis['qualified_trainers'] == 0:
+                                st.error("❌ No qualified trainers for this course")
+                                st.markdown("**Solution**: Add more qualified trainers in the Fleximatrix")
+
+                        with col2:
+                            st.markdown("### Week Availability")
+                            st.markdown(f"**Weeks with enough workdays**: {analysis['weeks_with_enough_days']}")
+
+                            if 'restricted_week_positions' in analysis:
+                                restrictions = analysis['restricted_week_positions']
+                                if restrictions:
+                                    st.markdown(f"**Restricted week positions**: {', '.join(restrictions)}")
+                                    st.markdown(f"**Weeks eliminated by restrictions**: {analysis['weeks_restricted']}")
+
+                            st.markdown(f"**Weeks with any trainer available**: {analysis['weeks_with_any_trainer']}")
+
+                            if analysis['weeks_with_any_trainer'] == 0:
+                                st.error("❌ No weeks with both enough workdays and available trainers")
+                                st.markdown("**Solution**: Reduce leave overlaps or add more qualified trainers")
+
+                        # Rest of the function...
+                        # Draw a timeline of week availability
+                        if analysis['qualified_trainers'] > 0:
+                            # ... (rest of the function code)
+                            pass  # Keep the rest of the function as is
+                else:
+                    st.info(
+                        "No unscheduled courses to analyze. Run an optimization first to identify scheduling problems.")
+
+            # And then modify how it's used in tab4:
+            # Instead of:
+            # with st.expander("Course Scheduling Problem Analysis", expanded=False):
+            #     display_scheduling_problem_analysis()
+
+            # Replace with inline code:
+            with st.expander("Course Scheduling Problem Analysis", expanded=False):
+                st.subheader("Analyze Unscheduled Course")
+
+                if hasattr(st.session_state, 'unscheduled_courses') and st.session_state.unscheduled_courses:
+                    # Create dropdown to select unscheduled course
+                    course_options = [f"{c['Course']} (Run {c['Run']}, {c['Language']})" for c in
+                                      st.session_state.unscheduled_courses]
+                    selected_course = st.selectbox("Select course to analyze", course_options)
+
+                    if selected_course:
+                        # Extract course details from selection
+                        idx = course_options.index(selected_course)
+                        course_info = st.session_state.unscheduled_courses[idx]
+
+                        # Run analysis
+                        analysis = st.session_state.scheduler.analyze_unscheduled_course(
+                            course_info['Course'], course_info['Language'], course_info['Run'])
+
+                        # Display results
+                        col1, col2 = st.columns(2)
+
+                        with col1:
+                            st.markdown("### Course Information")
+                            st.markdown(f"**Course**: {course_info['Course']}")
+                            st.markdown(f"**Language**: {course_info['Language']}")
+                            st.markdown(f"**Run**: {course_info['Run']}")
+                            st.markdown(f"**Qualified Trainers**: {analysis['qualified_trainers']}")
+                            st.markdown(f"**Course Duration**: {analysis['duration']} days")
+
+                            if analysis['qualified_trainers'] == 0:
+                                st.error("❌ No qualified trainers for this course")
+                                st.markdown("**Solution**: Add more qualified trainers in the Fleximatrix")
+
+                        with col2:
+                            st.markdown("### Week Availability")
+                            st.markdown(f"**Weeks with enough workdays**: {analysis['weeks_with_enough_days']}")
+
+                            if 'restricted_week_positions' in analysis:
+                                restrictions = analysis['restricted_week_positions']
+                                if restrictions:
+                                    st.markdown(f"**Restricted week positions**: {', '.join(restrictions)}")
+                                    st.markdown(f"**Weeks eliminated by restrictions**: {analysis['weeks_restricted']}")
+
+                            st.markdown(f"**Weeks with any trainer available**: {analysis['weeks_with_any_trainer']}")
+
+                            if analysis['weeks_with_any_trainer'] == 0:
+                                st.error("❌ No weeks with both enough workdays and available trainers")
+                                st.markdown("**Solution**: Reduce leave overlaps or add more qualified trainers")
+
+                        # Draw a timeline of week availability
+                        if analysis['qualified_trainers'] > 0:
+                            st.markdown("### Week-by-Week Availability")
+
+                            # Create dataframe for visualization
+                            weeks = sorted(analysis.get('weeks_with_trainers', {}).keys())
+                            if weeks:
+                                week_data = []
+
+                                for week in weeks:
+                                    trainers_available = analysis['weeks_with_trainers'].get(week, 0)
+                                    month = st.session_state.scheduler.week_to_month_map.get(week, 0)
+                                    week_info = st.session_state.scheduler.week_position_in_month.get(week, {})
+
+                                    # Check if this week is restricted
+                                    is_restricted = False
+                                    if course_info['Course'] in st.session_state.scheduler.week_restrictions:
+                                        restrictions = st.session_state.scheduler.week_restrictions[
+                                            course_info['Course']]
+                                        if (week_info.get('is_first') and restrictions.get('First', False)) or \
+                                                (week_info.get('is_second') and restrictions.get('Second', False)) or \
+                                                (week_info.get('is_third') and restrictions.get('Third', False)) or \
+                                                (week_info.get('is_fourth') and restrictions.get('Fourth', False)) or \
+                                                (week_info.get('is_last') and restrictions.get('Last', False)):
+                                            is_restricted = True
+
+                                    working_days = st.session_state.scheduler.weekly_working_days.get(week, 0)
+
+                                    week_data.append({
+                                        'Week': week,
+                                        'Month': month,
+                                        'Trainers Available': trainers_available,
+                                        'Working Days': working_days,
+                                        'Is Restricted': is_restricted
+                                    })
+
+                                week_df = pd.DataFrame(week_data)
+
+                                # Color columns based on conditions
+                                def color_trainers(val):
+                                    if val == 0:
+                                        color = 'red'
+                                    elif val < 3:
+                                        color = 'orange'
+                                    else:
+                                        color = 'green'
+                                    return f'background-color: {color}'
+
+                                def color_days(val, duration=analysis['duration']):
+                                    if val < duration:
+                                        color = 'red'
+                                    else:
+                                        color = 'green'
+                                    return f'background-color: {color}'
+
+                                def color_restricted(val):
+                                    return 'background-color: red' if val else 'background-color: white'
+
+                                # Apply styling
+                                styled_df = week_df.style.applymap(color_trainers, subset=['Trainers Available']) \
+                                    .applymap(lambda x: color_days(x, analysis['duration']), subset=['Working Days']) \
+                                    .applymap(color_restricted, subset=['Is Restricted'])
+
+                                st.dataframe(styled_df)
+
+                                # Identify the problem
+                                problems = []
+                                if analysis['weeks_with_enough_days'] == 0:
+                                    problems.append("❌ No weeks have enough working days for this course duration")
+                                if analysis.get('weeks_restricted') == analysis['weeks_with_enough_days']:
+                                    problems.append("❌ All potential weeks are restricted by week position constraints")
+                                if analysis['weeks_with_any_trainer'] == 0:
+                                    problems.append("❌ No trainers are available in valid weeks")
+
+                                st.markdown("### Summary")
+
+                                if problems:
+                                    for problem in problems:
+                                        st.error(problem)
+                                else:
+                                    st.warning(
+                                        "⚠️ This course may be unscheduled due to complex constraint interactions")
+
+                                st.markdown("### Recommended Actions")
+                                actions = []
+
+                                if analysis['qualified_trainers'] < 2:
+                                    actions.append("✅ Add more qualified trainers for this course")
+                                if analysis['duration'] > 3 and analysis['weeks_with_enough_days'] < 10:
+                                    actions.append(
+                                        "✅ Review public holidays that may be limiting available working days")
+                                if analysis.get('restricted_week_positions'):
+                                    actions.append(
+                                        "✅ Relax week position restrictions (use 'Disable All Week Restrictions' button)")
+                                if analysis['weeks_with_any_trainer'] < 5:
+                                    actions.append("✅ Review trainer leave patterns to reduce overlapping leaves")
+
+                                # Always suggest prioritizing courses
+                                actions.append(
+                                    "✅ Enable 'Prioritize scheduling all courses' option in Optimization Settings")
+
+                                for action in actions:
+                                    st.markdown(action)
+                else:
+                    st.info(
+                        "No unscheduled courses to analyze. Run an optimization first to identify scheduling problems.")
         pass
     except Exception as e:
         logging.error(f"Application error: {e}")
