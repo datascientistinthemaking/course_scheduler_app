@@ -2904,13 +2904,13 @@ def main():
                 # Add this code to the Results tab section (tab3)
                 # After loading and displaying the schedule dataframe
 
-                # Store unscheduled courses in session state
-                if 'unscheduled_courses' not in st.session_state:
-                    st.session_state.unscheduled_courses = []
+                # Instead, always access unscheduled_courses through session state:
+                if 'unscheduled_courses' in st.session_state and st.session_state.unscheduled_courses:
+                    st.warning(f"{len(st.session_state.unscheduled_courses)} courses could not be scheduled")
+                    with st.expander("View Unscheduled Courses"):
+                        unscheduled_df = pd.DataFrame(st.session_state.unscheduled_courses)
+                        st.dataframe(unscheduled_df, use_container_width=True)
 
-                # In the run_optimization method, after creating schedule_df, add:
-                # Store the unscheduled courses in session state
-                st.session_state.unscheduled_courses = unscheduled_courses if unscheduled_courses else []
 
                 # In the results tab, after displaying the schedule dataframe:
                 if hasattr(st.session_state, 'unscheduled_courses') and st.session_state.unscheduled_courses:
