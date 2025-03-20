@@ -635,6 +635,9 @@ class CourseScheduler:
                     # Add constraint: at most one assignment per trainer per week
                     model.Add(sum(week_assignments) <= 1)
         # If we're prioritizing all courses being scheduled, add variables to track this
+        # Here's the fixed code section for the "prioritize_all_courses" functionality
+        # This replaces the problem section in the run_optimization method
+
         if prioritize_all_courses:
             print("Adding priority for scheduling all courses")
             for (course, methodology, language, i), week_var in schedule.items():
@@ -676,19 +679,23 @@ class CourseScheduler:
 
                 if all_valid_weeks:
                     # Course is scheduled if week_var equals any valid week
+                    week_matches = []
                     for w in all_valid_weeks:
                         week_match = model.NewBoolVar(f"{course}_{i}_week_{w}")
                         model.Add(week_var == w).OnlyEnforceIf(week_match)
                         model.Add(week_var != w).OnlyEnforceIf(week_match.Not())
+                        week_matches.append(week_match)
 
-                    model.AddBoolOr(
-                        [model.NewBoolVar(f"{course}_{i}_week_{w}") for w in all_valid_weeks]).OnlyEnforceIf(
-                        is_scheduled)
+                    # If week_var matches any valid week, the course is scheduled
+                    model.AddBoolOr(week_matches).OnlyEnforceIf(is_scheduled)
+                    model.AddBoolAnd([match.Not() for match in week_matches]).OnlyEnforceIf(is_scheduled.Not())
 
-                    # Add a heavy penalty for not scheduling this course
+                    # Create the not_scheduled variable and add it to penalties
                     not_scheduled = model.NewBoolVar(f"{course}_{i}_not_scheduled")
-                    model.AddBoolNot(is_scheduled).OnlyEnforceIf(not_scheduled)
-                    model.AddBoolNot(not_scheduled).OnlyEnforceIf(is_scheduled)
+
+                    # This is the corrected line that replaces AddBoolNot
+                    model.Add(is_scheduled == False).OnlyEnforceIf(not_scheduled)
+                    model.Add(not_scheduled == False).OnlyEnforceIf(is_scheduled)
 
                     # Add to penalty list (with high weight)
                     unscheduled_course_penalties.append(not_scheduled)
