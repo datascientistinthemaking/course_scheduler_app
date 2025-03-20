@@ -2424,6 +2424,9 @@ def main():
         if 'optimization_status' not in st.session_state:
             st.session_state.optimization_status = None
 
+        if 'unscheduled_courses' not in st.session_state:
+            st.session_state.unscheduled_courses = []
+
         # Create tabs for a more organized workflow
         tab1, tab2, tab3, tab4 = st.tabs([
             "📤 Data Input & Setup",
@@ -2672,12 +2675,13 @@ def main():
                                 solution_strategy=solution_strategy,
                                 enforce_monthly_distribution=enforce_monthly,
                                 max_affinity_constraints=max_affinity,
-                                prioritize_all_courses=prioritize_all_courses  # Add this parameter
+                                prioritize_all_courses=prioritize_all_courses
                             )
 
                             # Store the optimization status in session state
+                            # Store the optimization status and unscheduled courses in session state
                             st.session_state.optimization_status = status
-                            st.session_state.unscheduled_courses = unscheduled_courses
+                            st.session_state.unscheduled_courses = unscheduled_courses if unscheduled_courses else []
 
                             # Check if the optimization was successful
                             if status in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
@@ -2691,9 +2695,9 @@ def main():
                                     schedule, trainer_assignments, solver)
 
                                 # Display success message with unscheduled course info
-                                if unscheduled_courses:
+                                if st.session_state.unscheduled_courses:
                                     st.warning(
-                                        f"Optimization completed with {len(unscheduled_courses)} unscheduled courses. See Results tab for details.")
+                                        f"Optimization completed with {len(st.session_state.unscheduled_courses)} unscheduled courses. See Results tab for details.")
                                 else:
                                     st.success("Optimization completed successfully! All courses were scheduled.")
                             else:
