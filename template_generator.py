@@ -13,7 +13,7 @@ def create_excel_template():
     # Sheet 1: CourseData
     course_data = pd.DataFrame({
         'Course Name': ['Course A', 'Course B', 'Course C', 'Course D', 'Course E'],
-        'Methodology': ['F2F', 'F2F', 'F2F', 'F2F', 'F2F'],
+        'Delivery Type': ['F2F', 'F2F', 'F2F', 'F2F', 'F2F'],
         'Language': ['EN', 'EN', 'EN', 'EN', 'EN'],
         'Runs': [3, 2, 4, 1, 2],
         'Duration': [5, 5, 5, 5, 5]  # All courses 5 days
