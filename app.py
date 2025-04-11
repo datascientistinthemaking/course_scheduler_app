@@ -2085,7 +2085,7 @@ def main():
                     Your Excel file should contain these sheets:
     
                     1. **CourseData**: Course information
-                       - Columns: Course Name, delivery_type, Language, Runs, Duration
+                       - Columns: Course Name, Delivery Type, Language, Runs, Duration
     
                     2. **TrainerData**: Trainer information
                        - Columns: Name, Title, Max_Days
