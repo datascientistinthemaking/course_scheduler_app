@@ -301,13 +301,13 @@ class CourseScheduler:
 
         # Create the schedule variables for each course and run
         for _, row in self.course_run_data.iterrows():
-            course, methodology, language, runs, duration = row["Course Name"], row["Methodology"], row["Language"], \
+            course, delivery_type, language, runs, duration = row["Course Name"], row["Delivery Type"], row["Language"], \
                 row["Runs"], row["Duration"]
 
             for i in range(runs):
                 # Create a variable for the start week
                 start_week = model.NewIntVar(1, max_weeks, f"start_week_{course}_{i}")
-                schedule[(course, methodology, language, i)] = start_week
+                schedule[(course, delivery_type, language, i)] = start_week
 
                 # Create trainer assignment variable
                 qualified_trainers = self.fleximatrix.get((course, language), [])
@@ -316,7 +316,7 @@ class CourseScheduler:
                     continue
 
                 trainer_var = model.NewIntVar(0, len(qualified_trainers) - 1, f"trainer_{course}_{i}")
-                trainer_assignments[(course, methodology, language, i)] = trainer_var
+                trainer_assignments[(course, delivery_type, language, i)] = trainer_var
 
                 # Only schedule in weeks with enough working days AND available trainers
                 valid_weeks = []
@@ -376,7 +376,7 @@ class CourseScheduler:
                 continue
 
             # For each course run, create a Boolean variable indicating if it's in this month
-            for (course, methodology, language, i), week_var in schedule.items():
+            for (course, delivery_type, language, i), week_var in schedule.items():
                 is_in_month = model.NewBoolVar(f"{course}_{i}_in_month_{month}")
 
                 # Add constraints: is_in_month is True if and only if week_var is one of month's weeks
@@ -435,7 +435,7 @@ class CourseScheduler:
 
         for course_name in set(self.course_run_data["Course Name"]):
             course_runs = []
-            for (course, methodology, language, i), var in schedule.items():
+            for (course, delivery_type, language, i), var in schedule.items():
                 if course == course_name:
                     course_runs.append((i, var))
 
@@ -497,8 +497,8 @@ class CourseScheduler:
         print("Adding trainer assignment constraints")
 
         # 4.1: Trainer availability - only assign trainers who are available during the scheduled week
-        for (course, methodology, language, i), week_var in schedule.items():
-            trainer_var = trainer_assignments.get((course, methodology, language, i))
+        for (course, delivery_type, language, i), week_var in schedule.items():
+            trainer_var = trainer_assignments.get((course, delivery_type, language, i))
             if trainer_var is None:
                 continue
 
@@ -525,7 +525,7 @@ class CourseScheduler:
         trainer_workload = {name: [] for name in self.consultant_data["Name"]}
 
         # Track course assignments for each trainer
-        for (course, methodology, language, i), trainer_var in trainer_assignments.items():
+        for (course, delivery_type, language, i), trainer_var in trainer_assignments.items():
             duration = self.course_run_data.loc[self.course_run_data["Course Name"] == course, "Duration"].iloc[0]
             qualified_trainers = self.fleximatrix.get((course, language), [])
 
@@ -597,8 +597,8 @@ class CourseScheduler:
                 # Find all course runs that this trainer might teach in this week
                 week_assignments = []
 
-                for (course, methodology, language, i), week_var in schedule.items():
-                    trainer_var = trainer_assignments.get((course, methodology, language, i))
+                for (course, delivery_type, language, i), week_var in schedule.items():
+                    trainer_var = trainer_assignments.get((course, delivery_type, language, i))
                     if trainer_var is None:
                         continue
 
@@ -640,7 +640,7 @@ class CourseScheduler:
 
         if prioritize_all_courses:
             print("Adding priority for scheduling all courses")
-            for (course, methodology, language, i), week_var in schedule.items():
+            for (course, delivery_type, language, i), week_var in schedule.items():
                 # Create a boolean variable that tracks if this course is scheduled
                 is_scheduled = model.NewBoolVar(f"{course}_{i}_is_scheduled")
 
@@ -757,7 +757,7 @@ class CourseScheduler:
             total_courses = 0
             scheduled_courses = 0
 
-            for (course, methodology, language, i), week_var in schedule.items():
+            for (course, delivery_type, language, i), week_var in schedule.items():
                 total_courses += 1
                 assigned_week = solver.Value(week_var)
                 start_date = self.weekly_calendar[assigned_week - 1].strftime("%Y-%m-%d")
@@ -771,7 +771,7 @@ class CourseScheduler:
                 else:  # Course wasn't scheduled
                     unscheduled_courses.append({
                         "Course": course,
-                        "Methodology": methodology,
+                        "Delivery Type": delivery_type,
                         "Language": language,
                         "Run": i + 1
                     })
@@ -781,8 +781,8 @@ class CourseScheduler:
                     for course in unscheduled_courses:
                         print(f"  - {course['Course']} (Run {course['Run']})")
                 # Get trainer assignment
-                if (course, methodology, language, i) in trainer_assignments:
-                    trainer_var = trainer_assignments[(course, methodology, language, i)]
+                if (course, delivery_type, language, i) in trainer_assignments:
+                    trainer_var = trainer_assignments[(course, delivery_type, language, i)]
                     trainer_idx = solver.Value(trainer_var)
 
                     if 0 <= trainer_idx < len(self.fleximatrix[(course, language)]):
@@ -795,7 +795,7 @@ class CourseScheduler:
                             "Week": assigned_week,
                             "Start Date": start_date,
                             "Course": course,
-                            "Methodology": methodology,
+                            "Delivery Type": delivery_type,
                             "Language": language,
                             "Run": i + 1,
                             "Trainer": trainer,
@@ -828,13 +828,13 @@ class CourseScheduler:
         # Create the schedule variables for each course and run
         print("Step 1: Basic scheduling variables")
         for _, row in self.course_run_data.iterrows():
-            course, methodology, language, runs, duration = row["Course Name"], row["Methodology"], row["Language"], \
+            course, delivery_type, language, runs, duration = row["Course Name"], row["Delivery Type"], row["Language"], \
                 row["Runs"], row["Duration"]
 
             for i in range(runs):
                 # Create a variable for the start week
                 start_week = model.NewIntVar(1, max_weeks, f"start_week_{course}_{i}")
-                schedule[(course, methodology, language, i)] = start_week
+                schedule[(course, delivery_type, language, i)] = start_week
 
                 # Create trainer assignment variable
                 qualified_trainers = self.fleximatrix.get((course, language), [])
@@ -843,7 +843,7 @@ class CourseScheduler:
                     continue
 
                 trainer_var = model.NewIntVar(0, len(qualified_trainers) - 1, f"trainer_{course}_{i}")
-                trainer_assignments[(course, methodology, language, i)] = trainer_var
+                trainer_assignments[(course, delivery_type, language, i)] = trainer_var
 
         # Check feasibility with just variables
         solver = cp_model.CpSolver()
@@ -861,7 +861,7 @@ class CourseScheduler:
         print("Step 2: Adding course spacing constraints")
         for course_name in set(self.course_run_data["Course Name"]):
             course_runs = []
-            for (course, methodology, language, i), var in schedule.items():
+            for (course, delivery_type, language, i), var in schedule.items():
                 if course == course_name:
                     course_runs.append((i, var))
 
@@ -891,8 +891,8 @@ class CourseScheduler:
 
         # STEP 3: Add trainer availability constraints
         print("Step 3: Adding trainer availability constraints")
-        for (course, methodology, language, i), week_var in schedule.items():
-            trainer_var = trainer_assignments.get((course, methodology, language, i))
+        for (course, delivery_type, language, i), week_var in schedule.items():
+            trainer_var = trainer_assignments.get((course, delivery_type, language, i))
             if trainer_var is None:
                 continue
 
@@ -932,7 +932,7 @@ class CourseScheduler:
         # STEP 4: Add week restrictions
         print("Step 4: Adding week restriction constraints")
         for course in self.week_restrictions:
-            for (c, methodology, language, i), week_var in schedule.items():
+            for (c, delivery_type, language, i), week_var in schedule.items():
                 if c != course:
                     continue
 
@@ -1005,7 +1005,7 @@ class CourseScheduler:
                 continue
 
             # For each course run, create a Boolean indicating if it's in this month
-            for (course, methodology, language, i), week_var in schedule.items():
+            for (course, delivery_type, language, i), week_var in schedule.items():
                 is_in_month = model.NewBoolVar(f"{course}_{i}_in_month_{month}")
 
                 # Add constraints: is_in_month is True iff week_var is in month's weeks
@@ -1088,7 +1088,7 @@ class CourseScheduler:
             affinity_penalties.append(too_close)
 
         # Add champion assignments (soft)
-        for (course, methodology, language, i), trainer_var in trainer_assignments.items():
+        for (course, delivery_type, language, i), trainer_var in trainer_assignments.items():
             qualified_trainers = self.fleximatrix.get((course, language), [])
 
             for t_idx, trainer in enumerate(qualified_trainers):
@@ -1104,7 +1104,7 @@ class CourseScheduler:
         trainer_workload = {name: [] for name in self.consultant_data["Name"]}
 
         # Track course assignments for each trainer
-        for (course, methodology, language, i), trainer_var in trainer_assignments.items():
+        for (course, delivery_type, language, i), trainer_var in trainer_assignments.items():
             duration = self.course_run_data.loc[self.course_run_data["Course Name"] == course, "Duration"].iloc[0]
             qualified_trainers = self.fleximatrix.get((course, language), [])
 
@@ -1181,13 +1181,13 @@ class CourseScheduler:
         if feasible:
             schedule_results = []
 
-            for (course, methodology, language, i), week_var in schedule.items():
+            for (course, delivery_type, language, i), week_var in schedule.items():
                 assigned_week = solver.Value(week_var)
                 start_date = self.weekly_calendar[assigned_week - 1].strftime("%Y-%m-%d")
 
                 # Get trainer assignment
-                if (course, methodology, language, i) in trainer_assignments:
-                    trainer_var = trainer_assignments[(course, methodology, language, i)]
+                if (course, delivery_type, language, i) in trainer_assignments:
+                    trainer_var = trainer_assignments[(course, delivery_type, language, i)]
                     trainer_idx = solver.Value(trainer_var)
 
                     if 0 <= trainer_idx < len(self.fleximatrix[(course, language)]):
@@ -1200,7 +1200,7 @@ class CourseScheduler:
                             "Week": assigned_week,
                             "Start Date": start_date,
                             "Course": course,
-                            "Methodology": methodology,
+                            "Delivery Type": delivery_type,
                             "Language": language,
                             "Run": i + 1,
                             "Trainer": trainer,
@@ -1311,7 +1311,7 @@ class CourseScheduler:
             # Calculate days assigned to each trainer
             trainer_days = {name: 0 for name in self.consultant_data["Name"]}
 
-            for (course, methodology, language, i), week_var in schedule.items():
+            for (course, delivery_type, language, i), week_var in schedule.items():
                 try:
                     # Get the course duration
                     duration_series = self.course_run_data.loc[
@@ -1323,12 +1323,12 @@ class CourseScheduler:
                     duration = duration_series.iloc[0]
 
                     # Check if this course+run has a trainer assignment
-                    if (course, methodology, language, i) not in trainer_assignments:
+                    if (course, delivery_type, language, i) not in trainer_assignments:
                         print(f"DEBUG: No trainer assignment for {course} run {i + 1}")
                         continue
 
                     # Get trainer assignment
-                    trainer_var = trainer_assignments[(course, methodology, language, i)]
+                    trainer_var = trainer_assignments[(course, delivery_type, language, i)]
                     trainer_idx = solver.Value(trainer_var)
 
                     # Check if the course+language has qualified trainers
@@ -1437,7 +1437,7 @@ class CourseScheduler:
         # Count courses by month
         monthly_counts = {month: 0 for month in range(1, 13)}
 
-        for (course, methodology, language, i), week_var in schedule.items():
+        for (course, delivery_type, language, i), week_var in schedule.items():
             assigned_week = solver.Value(week_var)
             month = self.week_to_month_map[assigned_week]
             monthly_counts[month] += 1
@@ -1487,11 +1487,11 @@ class CourseScheduler:
         trainer_courses = {name: 0 for name in self.consultant_data["Name"]}
         champion_courses = {name: 0 for name in self.consultant_data["Name"]}
 
-        for (course, methodology, language, i), week_var in schedule.items():
+        for (course, delivery_type, language, i), week_var in schedule.items():
             duration = self.course_run_data.loc[self.course_run_data["Course Name"] == course, "Duration"].iloc[0]
 
             # Get trainer assignment
-            trainer_var = trainer_assignments[(course, methodology, language, i)]
+            trainer_var = trainer_assignments[(course, delivery_type, language, i)]
             trainer_idx = solver.Value(trainer_var)
 
             if 0 <= trainer_idx < len(self.fleximatrix[(course, language)]):
@@ -2085,7 +2085,7 @@ def main():
                     Your Excel file should contain these sheets:
     
                     1. **CourseData**: Course information
-                       - Columns: Course Name, Methodology, Language, Runs, Duration
+                       - Columns: Course Name, delivery_type, Language, Runs, Duration
     
                     2. **TrainerData**: Trainer information
                        - Columns: Name, Title, Max_Days
