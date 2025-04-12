@@ -468,7 +468,7 @@ class CourseScheduler:
             if not c1_runs or not c2_runs:
                 continue
 
-            # Sort by run number (also fixing the sorting method)
+            # Sort by run number
             c1_runs.sort(key=lambda x: x[0])
             c2_runs.sort(key=lambda x: x[0])
 
@@ -476,22 +476,70 @@ class CourseScheduler:
             run1, var1 = c1_runs[0]
             run2, var2 = c2_runs[0]
 
-            # Soft affinity constraint
+            # Create variables to check if either course is in Q4
+            is_c1_q4 = model.NewBoolVar(f"{c1}_{run1}_in_q4")
+            is_c2_q4 = model.NewBoolVar(f"{c2}_{run2}_in_q4")
+
+            # Get Q4 weeks
+            q4_weeks = [w for w, m in self.week_to_month_map.items() if m in [10, 11, 12]]
+
+            # Set up Q4 detection for course 1
+            c1_q4_choices = []
+            for week in q4_weeks:
+                is_in_this_week = model.NewBoolVar(f"{c1}_{run1}_in_week_{week}")
+                model.Add(var1 == week).OnlyEnforceIf(is_in_this_week)
+                model.Add(var1 != week).OnlyEnforceIf(is_in_this_week.Not())
+                c1_q4_choices.append(is_in_this_week)
+            model.AddBoolOr(c1_q4_choices).OnlyEnforceIf(is_c1_q4)
+            model.AddBoolAnd([choice.Not() for choice in c1_q4_choices]).OnlyEnforceIf(is_c1_q4.Not())
+
+            # Set up Q4 detection for course 2
+            c2_q4_choices = []
+            for week in q4_weeks:
+                is_in_this_week = model.NewBoolVar(f"{c2}_{run2}_in_week_{week}")
+                model.Add(var2 == week).OnlyEnforceIf(is_in_this_week)
+                model.Add(var2 != week).OnlyEnforceIf(is_in_this_week.Not())
+                c2_q4_choices.append(is_in_this_week)
+            model.AddBoolOr(c2_q4_choices).OnlyEnforceIf(is_c2_q4)
+            model.AddBoolAnd([choice.Not() for choice in c2_q4_choices]).OnlyEnforceIf(is_c2_q4.Not())
+
+            # Either course in Q4 means reduced gap
+            either_in_q4 = model.NewBoolVar(f"{c1}_{c2}_either_in_q4")
+            model.AddBoolOr([is_c1_q4, is_c2_q4]).OnlyEnforceIf(either_in_q4)
+            model.AddBoolAnd([is_c1_q4.Not(), is_c2_q4.Not()]).OnlyEnforceIf(either_in_q4.Not())
+
+            # Soft affinity constraint with reduced gap for Q4
             too_close = model.NewBoolVar(f"affinity_too_close_{c1}_{c2}_{run1}_{run2}")
 
-            # Two options: either var2 >= var1 + gap_weeks OR var2 <= var1 - gap_weeks
-            far_enough_after = model.NewBoolVar(f"far_after_{c1}_{c2}_{run1}_{run2}")
-            far_enough_before = model.NewBoolVar(f"far_before_{c1}_{c2}_{run1}_{run2}")
+            # Regular gap weeks for non-Q4
+            far_enough_after_normal = model.NewBoolVar(f"far_after_{c1}_{c2}_{run1}_{run2}_normal")
+            far_enough_before_normal = model.NewBoolVar(f"far_before_{c1}_{c2}_{run1}_{run2}_normal")
 
-            model.Add(var2 >= var1 + gap_weeks).OnlyEnforceIf(far_enough_after)
-            model.Add(var2 <= var1 - gap_weeks).OnlyEnforceIf(far_enough_before)
+            # Reduced gap weeks (50% reduction) for Q4
+            reduced_gap = max(1, gap_weeks // 2)  # Ensure minimum 1 week gap
+            far_enough_after_q4 = model.NewBoolVar(f"far_after_{c1}_{c2}_{run1}_{run2}_q4")
+            far_enough_before_q4 = model.NewBoolVar(f"far_before_{c1}_{c2}_{run1}_{run2}_q4")
 
-            model.AddBoolOr([far_enough_after, far_enough_before]).OnlyEnforceIf(too_close.Not())
-            model.Add(var2 < var1 + gap_weeks).OnlyEnforceIf(too_close)
-            model.Add(var2 > var1 - gap_weeks).OnlyEnforceIf(too_close)
+            # Normal gap constraints
+            model.Add(var2 >= var1 + gap_weeks).OnlyEnforceIf([far_enough_after_normal, either_in_q4.Not()])
+            model.Add(var2 <= var1 - gap_weeks).OnlyEnforceIf([far_enough_before_normal, either_in_q4.Not()])
+
+            # Reduced gap constraints for Q4
+            model.Add(var2 >= var1 + reduced_gap).OnlyEnforceIf([far_enough_after_q4, either_in_q4])
+            model.Add(var2 <= var1 - reduced_gap).OnlyEnforceIf([far_enough_before_q4, either_in_q4])
+
+            # Combine normal and Q4 constraints
+            model.AddBoolOr([far_enough_after_normal, far_enough_before_normal]).OnlyEnforceIf([too_close.Not(), either_in_q4.Not()])
+            model.AddBoolOr([far_enough_after_q4, far_enough_before_q4]).OnlyEnforceIf([too_close.Not(), either_in_q4])
+
+            # Add violation constraints
+            model.Add(var2 < var1 + reduced_gap).OnlyEnforceIf([too_close, either_in_q4])
+            model.Add(var2 > var1 - reduced_gap).OnlyEnforceIf([too_close, either_in_q4])
+            model.Add(var2 < var1 + gap_weeks).OnlyEnforceIf([too_close, either_in_q4.Not()])
+            model.Add(var2 > var1 - gap_weeks).OnlyEnforceIf([too_close, either_in_q4.Not()])
 
             affinity_penalties.append(too_close)
-            print(f"  Added affinity constraint: {c1} and {c2} should be {gap_weeks} weeks apart")
+            print(f"  Added affinity constraint: {c1} and {c2} should be {gap_weeks} weeks apart (reduced to {reduced_gap} in Q4)")
 
         # CONSTRAINT 4: Trainer-specific constraints
         print("Adding trainer assignment constraints")
@@ -1071,21 +1119,70 @@ class CourseScheduler:
             run1, var1 = c1_runs[0]
             run2, var2 = c2_runs[0]
 
-            # Soft affinity constraint
+            # Create variables to check if either course is in Q4
+            is_c1_q4 = model.NewBoolVar(f"{c1}_{run1}_in_q4")
+            is_c2_q4 = model.NewBoolVar(f"{c2}_{run2}_in_q4")
+
+            # Get Q4 weeks
+            q4_weeks = [w for w, m in self.week_to_month_map.items() if m in [10, 11, 12]]
+
+            # Set up Q4 detection for course 1
+            c1_q4_choices = []
+            for week in q4_weeks:
+                is_in_this_week = model.NewBoolVar(f"{c1}_{run1}_in_week_{week}")
+                model.Add(var1 == week).OnlyEnforceIf(is_in_this_week)
+                model.Add(var1 != week).OnlyEnforceIf(is_in_this_week.Not())
+                c1_q4_choices.append(is_in_this_week)
+            model.AddBoolOr(c1_q4_choices).OnlyEnforceIf(is_c1_q4)
+            model.AddBoolAnd([choice.Not() for choice in c1_q4_choices]).OnlyEnforceIf(is_c1_q4.Not())
+
+            # Set up Q4 detection for course 2
+            c2_q4_choices = []
+            for week in q4_weeks:
+                is_in_this_week = model.NewBoolVar(f"{c2}_{run2}_in_week_{week}")
+                model.Add(var2 == week).OnlyEnforceIf(is_in_this_week)
+                model.Add(var2 != week).OnlyEnforceIf(is_in_this_week.Not())
+                c2_q4_choices.append(is_in_this_week)
+            model.AddBoolOr(c2_q4_choices).OnlyEnforceIf(is_c2_q4)
+            model.AddBoolAnd([choice.Not() for choice in c2_q4_choices]).OnlyEnforceIf(is_c2_q4.Not())
+
+            # Either course in Q4 means reduced gap
+            either_in_q4 = model.NewBoolVar(f"{c1}_{c2}_either_in_q4")
+            model.AddBoolOr([is_c1_q4, is_c2_q4]).OnlyEnforceIf(either_in_q4)
+            model.AddBoolAnd([is_c1_q4.Not(), is_c2_q4.Not()]).OnlyEnforceIf(either_in_q4.Not())
+
+            # Soft affinity constraint with reduced gap for Q4
             too_close = model.NewBoolVar(f"affinity_too_close_{c1}_{c2}_{run1}_{run2}")
 
-            # Two options: either var2 >= var1 + gap_weeks OR var2 <= var1 - gap_weeks
-            far_enough_after = model.NewBoolVar(f"far_after_{c1}_{c2}_{run1}_{run2}")
-            far_enough_before = model.NewBoolVar(f"far_before_{c1}_{c2}_{run1}_{run2}")
+            # Regular gap weeks for non-Q4
+            far_enough_after_normal = model.NewBoolVar(f"far_after_{c1}_{c2}_{run1}_{run2}_normal")
+            far_enough_before_normal = model.NewBoolVar(f"far_before_{c1}_{c2}_{run1}_{run2}_normal")
 
-            model.Add(var2 >= var1 + gap_weeks).OnlyEnforceIf(far_enough_after)
-            model.Add(var2 <= var1 - gap_weeks).OnlyEnforceIf(far_enough_before)
+            # Reduced gap weeks (50% reduction) for Q4
+            reduced_gap = max(1, gap_weeks // 2)  # Ensure minimum 1 week gap
+            far_enough_after_q4 = model.NewBoolVar(f"far_after_{c1}_{c2}_{run1}_{run2}_q4")
+            far_enough_before_q4 = model.NewBoolVar(f"far_before_{c1}_{c2}_{run1}_{run2}_q4")
 
-            model.AddBoolOr([far_enough_after, far_enough_before]).OnlyEnforceIf(too_close.Not())
-            model.Add(var2 < var1 + gap_weeks).OnlyEnforceIf(too_close)
-            model.Add(var2 > var1 - gap_weeks).OnlyEnforceIf(too_close)
+            # Normal gap constraints
+            model.Add(var2 >= var1 + gap_weeks).OnlyEnforceIf([far_enough_after_normal, either_in_q4.Not()])
+            model.Add(var2 <= var1 - gap_weeks).OnlyEnforceIf([far_enough_before_normal, either_in_q4.Not()])
+
+            # Reduced gap constraints for Q4
+            model.Add(var2 >= var1 + reduced_gap).OnlyEnforceIf([far_enough_after_q4, either_in_q4])
+            model.Add(var2 <= var1 - reduced_gap).OnlyEnforceIf([far_enough_before_q4, either_in_q4])
+
+            # Combine normal and Q4 constraints
+            model.AddBoolOr([far_enough_after_normal, far_enough_before_normal]).OnlyEnforceIf([too_close.Not(), either_in_q4.Not()])
+            model.AddBoolOr([far_enough_after_q4, far_enough_before_q4]).OnlyEnforceIf([too_close.Not(), either_in_q4])
+
+            # Add violation constraints
+            model.Add(var2 < var1 + reduced_gap).OnlyEnforceIf([too_close, either_in_q4])
+            model.Add(var2 > var1 - reduced_gap).OnlyEnforceIf([too_close, either_in_q4])
+            model.Add(var2 < var1 + gap_weeks).OnlyEnforceIf([too_close, either_in_q4.Not()])
+            model.Add(var2 > var1 - gap_weeks).OnlyEnforceIf([too_close, either_in_q4.Not()])
 
             affinity_penalties.append(too_close)
+            print(f"  Added affinity constraint: {c1} and {c2} should be {gap_weeks} weeks apart (reduced to {reduced_gap} in Q4)")
 
         # Add champion assignments (soft)
         for (course, delivery_type, language, i), trainer_var in trainer_assignments.items():
