@@ -1180,7 +1180,6 @@ class CourseScheduler:
         # Create and return results if feasible
         if feasible:
             schedule_results = []
-
             for (course, delivery_type, language, i), week_var in schedule.items():
                 assigned_week = solver.Value(week_var)
                 start_date = self.weekly_calendar[assigned_week - 1].strftime("%Y-%m-%d")
@@ -1459,7 +1458,7 @@ class CourseScheduler:
                 all_match = False
 
             validation_data.append({
-                "Month": month,
+                "Month": str(month),  # Convert month to string
                 "Target": target,
                 "Actual": actual,
                 "Difference": diff,
@@ -1478,7 +1477,13 @@ class CourseScheduler:
             "Status": "MATCH" if all_match else "MISMATCH"
         })
 
-        return pd.DataFrame(validation_data)
+        # Convert to DataFrame and ensure proper column types
+        df = pd.DataFrame(validation_data)
+        df['Target'] = df['Target'].astype(int)
+        df['Actual'] = df['Actual'].astype(int)
+        df['Difference'] = df['Difference'].astype(int)
+        
+        return df
 
     def generate_trainer_utilization_report(self, schedule, trainer_assignments, solver):
         """Generates a report on trainer utilization"""
@@ -2798,3 +2803,4 @@ if __name__ == "__main__":
     # Add this before your main() call
     st.write("App is running")
     main()
+
