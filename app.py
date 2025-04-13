@@ -249,8 +249,6 @@ class CourseScheduler:
         title = self.consultant_data.loc[self.consultant_data["Name"] == trainer_name, "Title"].iloc[0]
         return title == "Freelancer"
 
-    # Add this parameter to your method signature:
-    # Add this parameter to your method signature:
     def run_optimization(self, monthly_weight=5, champion_weight=4,
                          utilization_weight=3, affinity_weight=2,
                          utilization_target=70, solver_time_minutes=5,
@@ -258,12 +256,22 @@ class CourseScheduler:
                          solution_strategy="BALANCED",
                          enforce_monthly_distribution=False,
                          max_affinity_constraints=50,
-                         prioritize_all_courses=False):  # Add this parameter
+                         prioritize_all_courses=False,
+                         progress_callback=None):  # Add progress callback parameter
 
+        # Helper function to log and update progress
+        def log_progress(message, percent=None):
+            print(message)
+            if progress_callback:
+                progress_callback(percent, message) if percent is not None else None
+        
         # Get total F2F runs
+        log_progress("Starting optimization process...", 0.01)
         total_f2f_runs = sum(self.course_run_data["Runs"])
+        log_progress(f"Total F2F runs: {total_f2f_runs}", 0.03)
 
         # Create adjusted monthly demand dictionary from the demand dataframe
+        log_progress("Calculating monthly demand distribution...", 0.05)
         # Convert percentages to actual course counts
         adjusted_f2f_demand = {}
         total_percentage = self.monthly_demand['Percentage'].sum()
@@ -282,16 +290,19 @@ class CourseScheduler:
             max_month = max(adjusted_f2f_demand.items(), key=lambda x: x[1])[0]
             adjusted_f2f_demand[max_month] += (total_f2f_runs - total_allocated)
 
-        print("Monthly demand (converted from percentages):")
+        log_progress("Monthly demand calculation completed", 0.10)
         for month, demand in sorted(adjusted_f2f_demand.items()):
-            print(f"Month {month}: {demand} courses")
+            log_progress(f"Month {month}: {demand} courses")
 
         # Initialize model and variables
+        log_progress("Initializing optimization model...", 0.12)
         model = cp_model.CpModel()
         schedule = {}
         trainer_assignments = {}
         max_weeks = len(self.weekly_calendar)
 
+        log_progress("Creating variables for courses and trainers...", 0.15)
+        
         # All penalty lists
         month_deviation_penalties = []
         affinity_penalties = []
@@ -301,61 +312,66 @@ class CourseScheduler:
 
         # Create the schedule variables for each course and run
         for _, row in self.course_run_data.iterrows():
-            course, delivery_type, language, runs, duration = row["Course Name"], row["Delivery Type"], row["Language"], \
-                row["Runs"], row["Duration"]
+            try:
+                course, delivery_type, language, runs, duration = row["Course Name"], row["Delivery Type"], row["Language"], \
+                    row["Runs"], row["Duration"]
 
-            for i in range(runs):
-                # Create a variable for the start week
-                start_week = model.NewIntVar(1, max_weeks, f"start_week_{course}_{i}")
-                schedule[(course, delivery_type, language, i)] = start_week
+                for i in range(runs):
+                    # Create a variable for the start week
+                    start_week = model.NewIntVar(1, max_weeks, f"start_week_{course}_{i}")
+                    schedule[(course, delivery_type, language, i)] = start_week
 
-                # Create trainer assignment variable
-                qualified_trainers = self.fleximatrix.get((course, language), [])
-                if not qualified_trainers:
-                    print(f"Warning: No qualified trainers for {course} ({language})")
-                    continue
+                    # Create trainer assignment variable
+                    qualified_trainers = self.fleximatrix.get((course, language), [])
+                    if not qualified_trainers:
+                        log_progress(f"Warning: No qualified trainers for {course} ({language})")
+                        continue
 
-                trainer_var = model.NewIntVar(0, len(qualified_trainers) - 1, f"trainer_{course}_{i}")
-                trainer_assignments[(course, delivery_type, language, i)] = trainer_var
+                    trainer_var = model.NewIntVar(0, len(qualified_trainers) - 1, f"trainer_{course}_{i}")
+                    trainer_assignments[(course, delivery_type, language, i)] = trainer_var
+                    
+                    # Only schedule in weeks with enough working days AND available trainers
+                    valid_weeks = []
+                    for w, days in self.weekly_working_days.items():
+                        if days >= duration:
+                            # WEEK RESTRICTION CHECK: Skip if this course can't run in this week position
+                            if course in self.week_restrictions:
+                                # Get week position info
+                                week_info = self.week_position_in_month.get(w, {})
 
-                # Only schedule in weeks with enough working days AND available trainers
-                valid_weeks = []
-                for w, days in self.weekly_working_days.items():
-                    if days >= duration:
-                        # WEEK RESTRICTION CHECK: Skip if this course can't run in this week position
-                        if course in self.week_restrictions:
-                            # Get week position info
-                            week_info = self.week_position_in_month.get(w, {})
+                                # Check each restriction type
+                                skip_week = False
 
-                            # Check each restriction type
-                            skip_week = False
+                                if week_info.get('is_first') and self.week_restrictions[course].get('First', False):
+                                    skip_week = True
+                                elif week_info.get('is_second') and self.week_restrictions[course].get('Second', False):
+                                    skip_week = True
+                                elif week_info.get('is_third') and self.week_restrictions[course].get('Third', False):
+                                    skip_week = True
+                                elif week_info.get('is_fourth') and self.week_restrictions[course].get('Fourth', False):
+                                    skip_week = True
+                                elif week_info.get('is_last') and self.week_restrictions[course].get('Last', False):
+                                    skip_week = True
 
-                            if week_info.get('is_first') and self.week_restrictions[course].get('First', False):
-                                skip_week = True
-                            elif week_info.get('is_second') and self.week_restrictions[course].get('Second', False):
-                                skip_week = True
-                            elif week_info.get('is_third') and self.week_restrictions[course].get('Third', False):
-                                skip_week = True
-                            elif week_info.get('is_fourth') and self.week_restrictions[course].get('Fourth', False):
-                                skip_week = True
-                            elif week_info.get('is_last') and self.week_restrictions[course].get('Last', False):
-                                skip_week = True
+                                if skip_week:
+                                    # Skip this week for this course due to restriction
+                                    continue
 
-                            if skip_week:
-                                # Skip this week for this course due to restriction
-                                continue
+                            # Check if at least one qualified trainer is available this week
+                            for trainer in qualified_trainers:
+                                if self.is_trainer_available(trainer, w):
+                                    valid_weeks.append(w)
+                                    break
 
-                        # Check if at least one qualified trainer is available this week
-                        for trainer in qualified_trainers:
-                            if self.is_trainer_available(trainer, w):
-                                valid_weeks.append(w)
-                                break
+                    if valid_weeks:
+                        model.AddAllowedAssignments([start_week], [[w] for w in valid_weeks])
+                    else:
+                        print(f"Warning: No valid weeks for {course} run {i + 1}")
+            except Exception as e:
+                print(f"Error processing course {course}: {e}")
+                continue
 
-                if valid_weeks:
-                    model.AddAllowedAssignments([start_week], [[w] for w in valid_weeks])
-                else:
-                    print(f"Warning: No valid weeks for {course} run {i + 1}")
-
+        log_progress("Adding monthly distribution constraints...", 0.30)
         # CONSTRAINT 1: Track which month each course is assigned to and enforce monthly distribution
         print("Adding fixed monthly distribution constraints")
 
@@ -806,49 +822,60 @@ class CourseScheduler:
             scheduled_courses = 0
 
             for (course, delivery_type, language, i), week_var in schedule.items():
-                total_courses += 1
-                assigned_week = solver.Value(week_var)
-                start_date = self.weekly_calendar[assigned_week - 1].strftime("%Y-%m-%d")
-                if assigned_week > 0:  # Course was scheduled
-                    scheduled_courses += 1
-                    start_date = self.weekly_calendar[assigned_week - 1].strftime("%Y-%m-%d")
+                try:
+                    total_courses += 1
+                    assigned_week = solver.Value(week_var)
+                    if assigned_week > 0:  # Course was scheduled
+                        scheduled_courses += 1
+                        start_date = self.weekly_calendar[assigned_week - 1].strftime("%Y-%m-%d")
 
-                    # Get trainer assignment (rest of original code)
-                    # ...
+                        # Get trainer assignment if it exists
+                        if (course, delivery_type, language, i) in trainer_assignments:
+                            trainer_var = trainer_assignments[(course, delivery_type, language, i)]
+                            trainer_idx = solver.Value(trainer_var)
+                            
+                            # Check if this course has qualified trainers in the fleximatrix
+                            if (course, language) in self.fleximatrix and len(self.fleximatrix[(course, language)]) > 0:
+                                if 0 <= trainer_idx < len(self.fleximatrix[(course, language)]):
+                                    trainer = self.fleximatrix[(course, language)][trainer_idx]
+                                    is_champion = "✓" if self.course_champions.get((course, language)) == trainer else " "
+                                else:
+                                    # Handle out of range index
+                                    trainer = "Unknown (Index Error)"
+                                    is_champion = " "
+                            else:
+                                # Handle missing course in fleximatrix
+                                trainer = "No Qualified Trainers"
+                                is_champion = " "
 
-                else:  # Course wasn't scheduled
+                            schedule_results.append({
+                                "Week": assigned_week,
+                                "Start Date": start_date,
+                                "Course": course,
+                                "Delivery Type": delivery_type,
+                                "Language": language,
+                                "Run": i + 1,
+                                "Trainer": trainer,
+                                "Champion": is_champion
+                            })
+
+                    else:  # Course wasn't scheduled
+                        unscheduled_courses.append({
+                            "Course": course,
+                            "Delivery Type": delivery_type,
+                            "Language": language,
+                            "Run": i + 1
+                        })
+                except Exception as e:
+                    print(f"Error processing result for {course} (run {i+1}): {e}")
+                    # Add to unscheduled due to error
                     unscheduled_courses.append({
                         "Course": course,
                         "Delivery Type": delivery_type,
                         "Language": language,
-                        "Run": i + 1
+                        "Run": i + 1,
+                        "Error": str(e)
                     })
-                # If there were unscheduled courses and we were trying to prioritize all courses
-                if prioritize_all_courses and unscheduled_courses:
-                    print(f"WARNING: {len(unscheduled_courses)} courses could not be scheduled:")
-                    for course in unscheduled_courses:
-                        print(f"  - {course['Course']} (Run {course['Run']})")
-                # Get trainer assignment
-                if (course, delivery_type, language, i) in trainer_assignments:
-                    trainer_var = trainer_assignments[(course, delivery_type, language, i)]
-                    trainer_idx = solver.Value(trainer_var)
-
-                    if 0 <= trainer_idx < len(self.fleximatrix[(course, language)]):
-                        trainer = self.fleximatrix[(course, language)][trainer_idx]
-
-                        # Check if this is a champion course
-                        is_champion = "✓" if self.course_champions.get((course, language)) == trainer else " "
-
-                        schedule_results.append({
-                            "Week": assigned_week,
-                            "Start Date": start_date,
-                            "Course": course,
-                            "Delivery Type": delivery_type,
-                            "Language": language,
-                            "Run": i + 1,
-                            "Trainer": trainer,
-                            "Champion": is_champion
-                        })
 
             # Convert to DataFrame
             schedule_df = pd.DataFrame(schedule_results)
@@ -1278,19 +1305,28 @@ class CourseScheduler:
         if feasible:
             schedule_results = []
             for (course, delivery_type, language, i), week_var in schedule.items():
-                assigned_week = solver.Value(week_var)
-                start_date = self.weekly_calendar[assigned_week - 1].strftime("%Y-%m-%d")
+                try:
+                    assigned_week = solver.Value(week_var)
+                    start_date = self.weekly_calendar[assigned_week - 1].strftime("%Y-%m-%d")
 
-                # Get trainer assignment
-                if (course, delivery_type, language, i) in trainer_assignments:
-                    trainer_var = trainer_assignments[(course, delivery_type, language, i)]
-                    trainer_idx = solver.Value(trainer_var)
+                    # Get trainer assignment if it exists
+                    if (course, delivery_type, language, i) in trainer_assignments:
+                        trainer_var = trainer_assignments[(course, delivery_type, language, i)]
+                        trainer_idx = solver.Value(trainer_var)
 
-                    if 0 <= trainer_idx < len(self.fleximatrix[(course, language)]):
-                        trainer = self.fleximatrix[(course, language)][trainer_idx]
-
-                        # Check if this is a champion course
-                        is_champion = "✓" if self.course_champions.get((course, language)) == trainer else " "
+                        # Check if this course has qualified trainers in the fleximatrix
+                        if (course, language) in self.fleximatrix and len(self.fleximatrix[(course, language)]) > 0:
+                            if 0 <= trainer_idx < len(self.fleximatrix[(course, language)]):
+                                trainer = self.fleximatrix[(course, language)][trainer_idx]
+                                is_champion = "✓" if self.course_champions.get((course, language)) == trainer else " "
+                            else:
+                                # Handle out of range index
+                                trainer = "Unknown (Index Error)"
+                                is_champion = " "
+                        else:
+                            # Handle missing course in fleximatrix
+                            trainer = "No Qualified Trainers"
+                            is_champion = " "
 
                         schedule_results.append({
                             "Week": assigned_week,
@@ -1302,6 +1338,17 @@ class CourseScheduler:
                             "Trainer": trainer,
                             "Champion": is_champion
                         })
+
+                except Exception as e:
+                    print(f"Error processing result for {course} (run {i+1}): {e}")
+                    # Add to unscheduled due to error
+                    unscheduled_courses.append({
+                        "Course": course,
+                        "Delivery Type": delivery_type,
+                        "Language": language,
+                        "Run": i + 1,
+                        "Error": str(e)
+                    })
 
             # Convert to DataFrame
             schedule_df = pd.DataFrame(schedule_results)
@@ -1590,20 +1637,31 @@ class CourseScheduler:
         champion_courses = {name: 0 for name in self.consultant_data["Name"]}
 
         for (course, delivery_type, language, i), week_var in schedule.items():
-            duration = self.course_run_data.loc[self.course_run_data["Course Name"] == course, "Duration"].iloc[0]
+            try:
+                duration = self.course_run_data.loc[self.course_run_data["Course Name"] == course, "Duration"].iloc[0]
 
-            # Get trainer assignment
-            trainer_var = trainer_assignments[(course, delivery_type, language, i)]
-            trainer_idx = solver.Value(trainer_var)
+                # Get trainer assignment
+                if (course, delivery_type, language, i) not in trainer_assignments:
+                    continue
+                
+                trainer_var = trainer_assignments[(course, delivery_type, language, i)]
+                trainer_idx = solver.Value(trainer_var)
 
-            if 0 <= trainer_idx < len(self.fleximatrix[(course, language)]):
-                trainer = self.fleximatrix[(course, language)][trainer_idx]
-                trainer_days[trainer] += duration
-                trainer_courses[trainer] += 1
+                # Check if this course has an entry in the fleximatrix
+                if (course, language) not in self.fleximatrix:
+                    continue
+                
+                if 0 <= trainer_idx < len(self.fleximatrix[(course, language)]):
+                    trainer = self.fleximatrix[(course, language)][trainer_idx]
+                    trainer_days[trainer] += duration
+                    trainer_courses[trainer] += 1
 
-                # Check if this is a champion course
-                if self.course_champions.get((course, language)) == trainer:
-                    champion_courses[trainer] += 1
+                    # Check if this is a champion course
+                    if self.course_champions.get((course, language)) == trainer:
+                        champion_courses[trainer] += 1
+            except Exception as e:
+                print(f"Error in utilization report for {course} (run {i+1}): {e}")
+                continue
 
         # Create trainer utilization report dataframe
         utilization_data = []
@@ -2372,47 +2430,65 @@ def main():
 
                     # Find this section in app.py around line 1800-1850
                     if st.button("Optimize Schedule", key="optimize_schedule_btn"):
-                        with st.spinner(f"Running optimization (maximum time: {solver_time} minutes)..."):
-                            status, schedule_df, solver, schedule, trainer_assignments, unscheduled_courses = st.session_state.scheduler.run_optimization(
-                                monthly_weight=monthly_weight,
-                                champion_weight=0 if not enforce_champions else champion_weight,
-                                utilization_weight=utilization_weight,
-                                affinity_weight=affinity_weight,
-                                utilization_target=utilization_target,
-                                solver_time_minutes=solver_time,
-                                num_workers=num_workers,
-                                min_course_spacing=min_course_spacing,
-                                solution_strategy=solution_strategy,
-                                enforce_monthly_distribution=enforce_monthly,
-                                max_affinity_constraints=max_affinity,
-                                prioritize_all_courses=prioritize_all_courses
-                            )
+                        try:
+                            # Create containers for progress bar and output
+                            progress_container = st.container()
+                            output_container = st.container()
+                            
+                            # Initialize progress bar and status text
+                            progress_bar = progress_container.progress(0)
+                            status_text = output_container.empty()
+                            status_text.text("Initializing optimization...")
+                            
+                            # Function to update progress and output
+                            def update_progress(percent, message):
+                                progress_bar.progress(percent)
+                                status_text.text(message)
+                            
+                            with st.spinner(f"Running optimization (maximum time: {solver_time} minutes)..."):
+                                status, schedule_df, solver, schedule, trainer_assignments, unscheduled_courses = st.session_state.scheduler.run_optimization(
+                                    monthly_weight=monthly_weight,
+                                    champion_weight=0 if not enforce_champions else champion_weight,
+                                    utilization_weight=utilization_weight,
+                                    affinity_weight=affinity_weight,
+                                    utilization_target=utilization_target,
+                                    solver_time_minutes=solver_time,
+                                    num_workers=num_workers,
+                                    min_course_spacing=min_course_spacing,
+                                    solution_strategy=solution_strategy,
+                                    enforce_monthly_distribution=enforce_monthly,
+                                    max_affinity_constraints=max_affinity,
+                                    prioritize_all_courses=prioritize_all_courses,
+                                    progress_callback=update_progress  # Pass the progress callback
+                                )
 
-                            # Store the optimization status in session state
-                            # Store the optimization status and unscheduled courses in session state
-                            st.session_state.optimization_status = status
-                            st.session_state.unscheduled_courses = unscheduled_courses if unscheduled_courses else []
+                                # Store the optimization status in session state
+                                st.session_state.optimization_status = status
+                                st.session_state.unscheduled_courses = unscheduled_courses if unscheduled_courses else []
 
-                            # Check if the optimization was successful
-                            if status in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
-                                # Store results in session state
-                                st.session_state.schedule_df = schedule_df
+                                # Check if the optimization was successful
+                                if status in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
+                                    # Store results in session state
+                                    st.session_state.schedule_df = schedule_df
 
-                                # Generate the validation and utilization reports
-                                st.session_state.validation_df = st.session_state.scheduler.generate_monthly_validation(
-                                    schedule, solver)
-                                st.session_state.utilization_df = st.session_state.scheduler.generate_trainer_utilization_report(
-                                    schedule, trainer_assignments, solver)
+                                    # Generate the validation and utilization reports
+                                    st.session_state.validation_df = st.session_state.scheduler.generate_monthly_validation(
+                                        schedule, solver)
+                                    st.session_state.utilization_df = st.session_state.scheduler.generate_trainer_utilization_report(
+                                        schedule, trainer_assignments, solver)
 
-                                # Display success message with unscheduled course info
-                                if st.session_state.unscheduled_courses:
-                                    st.warning(
-                                        f"Optimization completed with {len(st.session_state.unscheduled_courses)} unscheduled courses. See Results tab for details.")
+                                    # Display success message with unscheduled course info
+                                    if st.session_state.unscheduled_courses:
+                                        st.warning(
+                                            f"Optimization completed with {len(st.session_state.unscheduled_courses)} unscheduled courses. See Results tab for details.")
+                                    else:
+                                        st.success("Optimization completed successfully! All courses were scheduled.")
                                 else:
-                                    st.success("Optimization completed successfully! All courses were scheduled.")
-                            else:
-                                st.error(
-                                    f"Optimization failed with status: {solver.StatusName(status)}. Try adjusting your parameters or check the Debug tab.")
+                                    st.error(
+                                        f"Optimization failed with status: {solver.StatusName(status)}. Try adjusting your parameters or check the Debug tab.")
+                        except Exception as e:
+                            st.error(f"An error occurred: {e}")
+                            logging.error(f"Optimization error: {str(e)}")
 
         with tab3:
             if st.session_state.schedule_df is not None:
