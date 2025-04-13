@@ -9,6 +9,8 @@ from openpyxl import Workbook
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.drawing.image import Image
+import threading
+import time
 
 # Set up logging at the beginning of your app.py
 logging.basicConfig(level=logging.ERROR)
@@ -278,19 +280,32 @@ class CourseScheduler:
         # Apply accelerated mode optimizations if enabled
         if accelerated_mode:
             log_progress("Running in accelerated mode - applying speed optimizations...", 0.01)
-            # Reduce affinity constraints 
-            max_affinity_constraints = max(5, max_affinity_constraints // 4)
-            # Simplify solution strategy for speed
-            solution_strategy = "FIND_FEASIBLE_FAST"
-            # Increase number of workers
-            num_workers = min(16, num_workers * 2)
-            # Simplify the monthly distribution objective
-            monthly_weight = monthly_weight // 2
-            # Reduce other penalties
-            champion_weight = champion_weight // 2
-            utilization_weight = utilization_weight // 2
-            # Reduce spacing requirements
-            min_course_spacing = max(1, min_course_spacing - 1)
+            
+            # Check model size to determine level of acceleration needed
+            total_courses = sum(self.course_run_data["Runs"])
+            
+            if total_courses > 300:
+                log_progress(f"Large problem detected ({total_courses} courses) - applying aggressive optimizations", 0.02)
+                # Very aggressive settings for large problems
+                max_affinity_constraints = max(3, max_affinity_constraints // 8)
+                solution_strategy = "FIND_FEASIBLE_FAST"
+                num_workers = min(16, num_workers * 2)
+                monthly_weight = monthly_weight // 4
+                champion_weight = champion_weight // 4
+                utilization_weight = utilization_weight // 4
+                min_course_spacing = 1  # Minimum possible spacing
+                # Shorten time limit to avoid excessive solving
+                solver_time_minutes = min(solver_time_minutes, 10)
+                log_progress("Aggressive optimizations applied for large problem", 0.03)
+            else:
+                # Standard optimizations for smaller problems
+                max_affinity_constraints = max(5, max_affinity_constraints // 4)
+                solution_strategy = "FIND_FEASIBLE_FAST"
+                num_workers = min(16, num_workers * 2)
+                monthly_weight = monthly_weight // 2
+                champion_weight = champion_weight // 2
+                utilization_weight = utilization_weight // 2
+                min_course_spacing = max(1, min_course_spacing - 1)
 
         # Get total F2F runs
         log_progress("Starting optimization process...", 0.01)
@@ -886,37 +901,31 @@ class CourseScheduler:
         except Exception as e:
             log_progress(f"Warning: Some solver parameters could not be set: {str(e)}", None)
         
-        # Create a callback to track time
-        class TimeoutCallback(cp_model.CpSolverSolutionCallback):
-            def __init__(self, time_limit):
+        # Create a simple solution counter callback instead of timeout
+        class SolutionCounter(cp_model.CpSolverSolutionCallback):
+            def __init__(self):
                 cp_model.CpSolverSolutionCallback.__init__(self)
-                self._time_limit = time_limit
-                self._start_time = datetime.datetime.now()
-                self._stop_search = False
-                self._first_solution_time = None
                 self._solution_count = 0
+                self._start_time = datetime.datetime.now()
                 
             def on_solution_callback(self):
                 self._solution_count += 1
                 current_time = datetime.datetime.now()
-                if not self._first_solution_time:
-                    self._first_solution_time = current_time
-                    log_progress(f"First solution found in {(current_time - self._start_time).total_seconds():.1f} seconds", 0.75)
-                
-                # Stop after time limit
                 elapsed_seconds = (current_time - self._start_time).total_seconds()
-                if elapsed_seconds >= self._time_limit * 0.95:  # Stop at 95% of time limit to ensure we return on time
-                    log_progress(f"Time limit approaching, stopping search after {self._solution_count} solutions", 0.85)
-                    self._stop_search = True
-                    
-            def stop_search(self):
-                return self._stop_search
+                
+                if self._solution_count == 1:
+                    log_progress(f"First solution found in {elapsed_seconds:.1f} seconds", 0.75)
+                elif self._solution_count % 10 == 0:  # Log every 10 solutions
+                    log_progress(f"Found {self._solution_count} solutions in {elapsed_seconds:.1f} seconds", 0.80)
+                
+            def solution_count(self):
+                return self._solution_count
         
         log_progress(f"Configuring solver with {solver_time_minutes} minute time limit...", 0.60)
         
-        # Create and use the timeout callback
-        timeout_callback = TimeoutCallback(solver_time_minutes * 60)
-
+        # Create and use solution counter
+        solution_counter = SolutionCounter()
+        
         # Set solution strategy
         if solution_strategy == "MAXIMIZE_QUALITY":
             solver.parameters.optimize_with_max_hs = True
@@ -926,13 +935,44 @@ class CourseScheduler:
 
         # Solve the model
         log_progress("Starting solver...", 0.65)
+        
+        # Create a separate thread to update status periodically
+        def status_updater():
+            start_time = datetime.datetime.now()
+            update_interval = 10  # seconds
+            while not solver_done:
+                # Sleep for a bit
+                time.sleep(update_interval)
+                
+                # Calculate elapsed time
+                elapsed_time = (datetime.datetime.now() - start_time).total_seconds()
+                minutes = int(elapsed_time // 60)
+                seconds = int(elapsed_time % 60)
+                
+                # Update status
+                log_progress(f"Optimizer still running ({minutes}m {seconds}s elapsed)...", 0.70 + min(0.15, elapsed_time / (solver_time_minutes * 60) * 0.15))
+                
+                # Adjust update interval as time progresses
+                update_interval = min(30, update_interval + 5)  # gradually increase interval up to 30 seconds
+        
+        # Flag to signal when solver is done
+        solver_done = False
+        
+        # Start the status update thread
+        status_thread = threading.Thread(target=status_updater)
+        status_thread.daemon = True  # Thread will exit when main thread exits
+        status_thread.start()
+        
         try:
-            status = solver.Solve(model, timeout_callback)
+            status = solver.Solve(model, solution_counter)
         except Exception as e:
             log_progress(f"Error during solving: {str(e)}", 0.85)
             # Try again without the callback as a fallback
             log_progress("Retrying without custom timeout...", 0.86)
             status = solver.Solve(model)
+        finally:
+            # Signal the status thread to stop
+            solver_done = True
             
         log_progress("Solver completed", 0.90)
 
