@@ -256,8 +256,8 @@ class CourseScheduler:
         title = self.consultant_data.loc[self.consultant_data["Name"] == trainer_name, "Title"].iloc[0]
         return title == "Freelancer"
 
-    def run_optimization(self, monthly_weight=5, champion_weight=4,
-                         utilization_weight=3, affinity_weight=2,
+    def run_optimization(self, monthly_weight=5, 
+                         affinity_weight=2,
                          utilization_target=70, solver_time_minutes=5,
                          num_workers=8, min_course_spacing=2,
                          solution_strategy="BALANCED",
@@ -265,7 +265,8 @@ class CourseScheduler:
                          max_affinity_constraints=50,
                          prioritize_all_courses=False,
                          accelerated_mode=False,
-                         progress_callback=None):  # Add progress callback parameter
+                         enforce_champions=True,
+                         progress_callback=None):
 
         # Helper function to log and update progress
         def log_progress(message, percent=None):
@@ -292,9 +293,6 @@ class CourseScheduler:
                 solution_strategy = "FIND_FEASIBLE_FAST"
                 num_workers = min(32, os.cpu_count() or 8)  # Use all available CPU cores if possible
                 monthly_weight = 1  # Minimal monthly distribution weight
-                champion_weight = 1  # Minimal champion weight
-                utilization_weight = 1  # Minimal utilization weight
-                min_course_spacing = 1  # Minimum possible spacing
                 # Drastically shorten time limit
                 solver_time_minutes = min(solver_time_minutes, 5)
                 
@@ -313,8 +311,6 @@ class CourseScheduler:
                 solution_strategy = "FIND_FEASIBLE_FAST"
                 num_workers = min(16, num_workers * 2)
                 monthly_weight = monthly_weight // 4
-                champion_weight = champion_weight // 4
-                utilization_weight = utilization_weight // 4
                 min_course_spacing = 1  # Minimum possible spacing
                 # Shorten time limit to avoid excessive solving
                 solver_time_minutes = min(solver_time_minutes, 10)
@@ -325,8 +321,6 @@ class CourseScheduler:
                 solution_strategy = "FIND_FEASIBLE_FAST"
                 num_workers = min(16, num_workers * 2)
                 monthly_weight = monthly_weight // 2
-                champion_weight = champion_weight // 2
-                utilization_weight = utilization_weight // 2
                 min_course_spacing = max(1, min_course_spacing - 1)
 
         # Get total F2F runs
@@ -385,13 +379,21 @@ class CourseScheduler:
                     start_week = model.NewIntVar(1, max_weeks, f"start_week_{course}_{i}")
                     schedule[(course, delivery_type, language, i)] = start_week
 
-                    # Create trainer assignment variable
-                    qualified_trainers = self.fleximatrix.get((course, language), [])
-                    if not qualified_trainers:
-                        log_progress(f"Warning: No qualified trainers for {course} ({language})")
-                        continue
-
-                    trainer_var = model.NewIntVar(0, len(qualified_trainers) - 1, f"trainer_{course}_{i}")
+                    # If champions are prioritized and there is a champion for this course, 
+                    # prepare to add constraints after checking week availability
+                    use_champion = False
+                    champion_idx = -1
+                    
+                    if enforce_champions and (course, language) in self.course_champions:
+                        champion = self.course_champions.get((course, language))
+                        if champion in self.fleximatrix.get((course, language), []):
+                            # Get the index of the champion in the qualified trainers list
+                            champion_idx = self.fleximatrix.get((course, language)).index(champion)
+                            use_champion = True
+                            log_progress(f"Will prioritize champion {champion} for {course} ({language}) when available")
+                    
+                    # Create normal trainer assignment variable (we'll add champion constraints later)
+                    trainer_var = model.NewIntVar(0, len(self.fleximatrix.get((course, language), [])), f"trainer_{course}_{i}")
                     trainer_assignments[(course, delivery_type, language, i)] = trainer_var
                     
                     # Only schedule in weeks with enough working days AND available trainers
@@ -422,13 +424,31 @@ class CourseScheduler:
                                     continue
 
                             # Check if at least one qualified trainer is available this week
-                            for trainer in qualified_trainers:
+                            for trainer in self.fleximatrix.get((course, language), []):
                                 if self.is_trainer_available(trainer, w):
                                     valid_weeks.append(w)
                                     break
 
                     if valid_weeks:
                         model.AddAllowedAssignments([start_week], [[w] for w in valid_weeks])
+                        
+                        # Now add champion constraints for each valid week if needed
+                        if use_champion and champion_idx >= 0:
+                            champion = self.fleximatrix.get((course, language))[champion_idx]
+                            
+                            # For each valid week, check if the champion is available
+                            for week in valid_weeks:
+                                if self.is_trainer_available(champion, week):
+                                    # Create a boolean variable that is true if this course is scheduled in this week
+                                    is_in_week = model.NewBoolVar(f"{course}_{i}_in_week_{week}")
+                                    model.Add(start_week == week).OnlyEnforceIf(is_in_week)
+                                    model.Add(start_week != week).OnlyEnforceIf(is_in_week.Not())
+                                    
+                                    # If the course is scheduled in this week, the trainer must be the champion
+                                    model.Add(trainer_var == champion_idx).OnlyEnforceIf(is_in_week)
+                                    
+                                    log_progress(f"Added constraint: If {course} run {i+1} is in week {week}, champion {champion} must teach it", None)
+                                    
                     else:
                         print(f"Warning: No valid weeks for {course} run {i + 1}")
             except Exception as e:
@@ -745,23 +765,12 @@ class CourseScheduler:
                 model.Add(total_workload == sum(weighted_terms))
                 # Enforce maximum workload
                 model.Add(total_workload <= max_days)
-
-                # 4.4: For non-freelancers, encourage higher utilization (soft constraint)
-                if not self.is_freelancer(trainer):
-                    # Calculate target utilization as a percentage of max days
-                    target_days = int(max_days * (utilization_target / 100))  # Use the parameter
-
-                    # Add penalty for underutilization
-                    under_target = model.NewBoolVar(f"{trainer}_under_target")
-                    model.Add(total_workload < target_days).OnlyEnforceIf(under_target)
-                    model.Add(total_workload >= target_days).OnlyEnforceIf(under_target.Not())
-
-                    # Higher priority trainers get stronger penalty for underutilization
-                    priority = self.get_trainer_priority(trainer)
-                    penalty_weight = 7 - priority  # Invert priority (1 becomes 6, 6 becomes 1)
-
-                    for _ in range(penalty_weight):
-                        trainer_utilization_penalties.append(under_target)
+                
+                # Add hard constraint for minimum utilization if specified
+                min_days = max(1, int(max_days * utilization_target / 100))  # Convert percentage to days
+                if min_days > 0:
+                    model.Add(total_workload >= min_days)
+                    log_progress(f"Adding hard constraint: Trainer {trainer} utilization must be at least {min_days} days")
 
         # NEW CODE: Add constraint to prevent trainers from teaching multiple courses in same week
         # Add this right after the trainer workload constraints
@@ -887,24 +896,19 @@ class CourseScheduler:
             # and adjust other weights to allow more flexibility
             unscheduled_weight = 20  # Very high weight to make this the top priority
             monthly_weight = monthly_weight // 2 if enforce_monthly_distribution else monthly_weight
-            champion_weight = champion_weight // 2
             min_course_spacing = max(1, min_course_spacing - 1)  # Reduce spacing requirements
 
             # Combined objective function with course scheduling priority
             model.Minimize(
                 unscheduled_weight * sum(unscheduled_course_penalties) +
                 monthly_weight * sum(month_deviation_penalties) +
-                affinity_weight * sum(affinity_penalties) +
-                champion_weight * sum(champion_assignment_penalties) +
-                utilization_weight * sum(trainer_utilization_penalties)
+                affinity_weight * sum(affinity_penalties)
             )
         else:
-            # Original objective function
+            # Original objective function without champion and utilization penalties
             model.Minimize(
                 monthly_weight * sum(month_deviation_penalties) +
-                affinity_weight * sum(affinity_penalties) +
-                champion_weight * sum(champion_assignment_penalties) +
-                utilization_weight * sum(trainer_utilization_penalties)
+                affinity_weight * sum(affinity_penalties)
             )
 
         # Initialize solver with customized parameters
@@ -1470,23 +1474,12 @@ class CourseScheduler:
                 model.Add(total_workload == sum(weighted_terms))
                 # Enforce maximum workload
                 model.Add(total_workload <= max_days)
-
-                # For non-freelancers, encourage higher utilization
-                if not self.is_freelancer(trainer):
-                    # Calculate target utilization as a percentage of max days
-                    target_days = int(max_days * (70 / 100))  # 70% target
-
-                    # Add penalty for underutilization
-                    under_target = model.NewBoolVar(f"{trainer}_under_target")
-                    model.Add(total_workload < target_days).OnlyEnforceIf(under_target)
-                    model.Add(total_workload >= target_days).OnlyEnforceIf(under_target.Not())
-
-                    # Higher priority trainers get stronger penalty
-                    priority = self.get_trainer_priority(trainer)
-                    penalty_weight = 7 - priority  # Invert priority (1 becomes 6, 6 becomes 1)
-
-                    for _ in range(penalty_weight):
-                        trainer_utilization_penalties.append(under_target)
+                
+                # Add hard constraint for minimum utilization if specified
+                min_days = max(1, int(max_days * utilization_target / 100))  # Convert percentage to days
+                if min_days > 0:
+                    model.Add(total_workload >= min_days)
+                    log_progress(f"Adding hard constraint: Trainer {trainer} utilization must be at least {min_days} days")
 
         # Objective function
         model.Minimize(
@@ -2765,10 +2758,6 @@ def main():
                     st.markdown('<div class="slider-header">Priority Weights</div>', unsafe_allow_html=True)
                     monthly_weight = st.slider("Monthly Distribution Priority", 1, 10, 5,
                                                help="Higher values enforce monthly targets more strictly")
-                    champion_weight = st.slider("Champion Assignment Priority", 1, 10, 4,
-                                                help="Higher values prioritize assigning course champions")
-                    utilization_weight = st.slider("Trainer Utilization Priority", 1, 10, 3,
-                                                   help="Higher values encourage higher trainer utilization")
                     affinity_weight = st.slider("Course Affinity Priority", 1, 10, 2,
                                                 help="Higher values enforce gaps between related courses")
                     st.markdown('</div>', unsafe_allow_html=True)
@@ -2794,8 +2783,8 @@ def main():
                     max_affinity = st.slider(
                         "Maximum Affinity Constraints",
                         min_value=10,
-                        max_value=200,
-                        value=50,
+                        max_value=700,
+                        value=200,
                         help="Limit the number of course affinity constraints to reduce memory usage"
                     )
                     st.markdown('</div>', unsafe_allow_html=True)
@@ -2827,12 +2816,6 @@ def main():
                         help="Enable faster optimization with simplified model (use if regular optimization is too slow)"
                     )
 
-                    solution_strategy = st.selectbox(
-                        "Solution Strategy",
-                        options=["BALANCED", "MAXIMIZE_QUALITY", "FIND_FEASIBLE_FAST"],
-                        index=0,
-                        help="BALANCED = Default, MAXIMIZE_QUALITY = Best solution but slower, FIND_FEASIBLE_FAST = Any valid solution quickly"
-                    )
                     solver_time = st.slider(
                         "Solver Time Limit (minutes)",
                         min_value=1,
@@ -2897,19 +2880,18 @@ def main():
                             with st.spinner(f"Running optimization (maximum time: {solver_time} minutes)..."):
                                 status, schedule_df, solver, schedule, trainer_assignments, unscheduled_courses = st.session_state.scheduler.run_optimization(
                                     monthly_weight=monthly_weight,
-                                    champion_weight=0 if not enforce_champions else champion_weight,
-                                    utilization_weight=utilization_weight,
                                     affinity_weight=affinity_weight,
                                     utilization_target=utilization_target,
                                     solver_time_minutes=solver_time,
                                     num_workers=num_workers,
                                     min_course_spacing=min_course_spacing,
-                                    solution_strategy=solution_strategy,
+                                    solution_strategy="BALANCED", # Default to balanced strategy
                                     enforce_monthly_distribution=enforce_monthly,
                                     max_affinity_constraints=max_affinity,
                                     prioritize_all_courses=prioritize_all_courses,
                                     accelerated_mode=accelerated_mode,
-                                    progress_callback=update_progress  # Pass the progress callback
+                                    progress_callback=update_progress,  # Pass the progress callback
+                                    enforce_champions=enforce_champions  # Pass the enforce_champions parameter
                                 )
 
                                 # Store the optimization status in session state
@@ -2981,14 +2963,15 @@ def main():
                                         "No optimization results found. Running a quick optimization to generate visualizations...")
                                     # Run a quick new optimization just to get solver state and schedule objects
                                     status, schedule_df, solver, schedule, trainer_assignments, _ = st.session_state.scheduler.run_optimization(
-                                        monthly_weight=5, champion_weight=4,
-                                        utilization_weight=3, affinity_weight=2,
+                                        monthly_weight=5,
+                                        affinity_weight=2,
                                         utilization_target=70, solver_time_minutes=1,
                                         num_workers=8, min_course_spacing=2,
                                         solution_strategy="FIND_FEASIBLE_FAST",
                                         enforce_monthly_distribution=False,
                                         prioritize_all_courses=False,
-                                        accelerated_mode=True
+                                        accelerated_mode=True,
+                                        enforce_champions=True
                                     )
 
                                     if status not in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
@@ -3002,14 +2985,15 @@ def main():
                                     # but use the existing solution as a starting point
                                     st.info("Using existing optimization results for visualization...")
                                     status, _, solver, schedule, trainer_assignments, _ = st.session_state.scheduler.run_optimization(
-                                        monthly_weight=5, champion_weight=4,
-                                        utilization_weight=3, affinity_weight=2,
+                                        monthly_weight=5, 
+                                        affinity_weight=2,
                                         utilization_target=70, solver_time_minutes=0.1,  # Very short time
                                         num_workers=8, min_course_spacing=2,
                                         solution_strategy="FIND_FEASIBLE_FAST",
                                         enforce_monthly_distribution=False,
                                         prioritize_all_courses=False,
-                                        accelerated_mode=True
+                                        accelerated_mode=True,
+                                        enforce_champions=True
                                     )
 
                                 # Rest of the visualization code stays the same...
