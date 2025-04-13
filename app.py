@@ -769,8 +769,9 @@ class CourseScheduler:
                 # Add hard constraint for minimum utilization if specified
                 min_days = max(1, int(max_days * utilization_target / 100))  # Convert percentage to days
                 if min_days > 0:
-                    model.Add(total_workload >= min_days)
-                    log_progress(f"Adding hard constraint: Trainer {trainer} utilization must be at least {min_days} days")
+                    # Commenting out the hard constraint as requested
+                    # model.Add(total_workload >= min_days)
+                    log_progress(f"Skipping minimum utilization constraint for Trainer {trainer} (would be {min_days} days)")
 
         # NEW CODE: Add constraint to prevent trainers from teaching multiple courses in same week
         # Add this right after the trainer workload constraints
@@ -1478,8 +1479,9 @@ class CourseScheduler:
                 # Add hard constraint for minimum utilization if specified
                 min_days = max(1, int(max_days * utilization_target / 100))  # Convert percentage to days
                 if min_days > 0:
-                    model.Add(total_workload >= min_days)
-                    log_progress(f"Adding hard constraint: Trainer {trainer} utilization must be at least {min_days} days")
+                    # Commenting out the hard constraint as requested
+                    # model.Add(total_workload >= min_days)
+                    log_progress(f"Skipping minimum utilization constraint for Trainer {trainer} (would be {min_days} days)")
 
         # Objective function
         model.Minimize(
