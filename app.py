@@ -9,9 +9,6 @@ from openpyxl import Workbook
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.drawing.image import Image
-import threading
-import time
-import os
 
 # Set up logging at the beginning of your app.py
 logging.basicConfig(level=logging.ERROR)
@@ -256,8 +253,8 @@ class CourseScheduler:
         title = self.consultant_data.loc[self.consultant_data["Name"] == trainer_name, "Title"].iloc[0]
         return title == "Freelancer"
 
-    def run_optimization(self, monthly_weight=5, 
-                         affinity_weight=2,
+    def run_optimization(self, monthly_weight=5, champion_weight=4,
+                         utilization_weight=3, affinity_weight=2,
                          utilization_target=70, solver_time_minutes=5,
                          num_workers=8, min_course_spacing=2,
                          solution_strategy="BALANCED",
@@ -265,8 +262,7 @@ class CourseScheduler:
                          max_affinity_constraints=50,
                          prioritize_all_courses=False,
                          accelerated_mode=False,
-                         enforce_champions=True,
-                         progress_callback=None):
+                         progress_callback=None):  # Add progress callback parameter
 
         # Helper function to log and update progress
         def log_progress(message, percent=None):
@@ -282,46 +278,15 @@ class CourseScheduler:
         # Apply accelerated mode optimizations if enabled
         if accelerated_mode:
             log_progress("Running in accelerated mode - applying speed optimizations...", 0.01)
-            
-            # Check model size to determine level of acceleration needed
-            total_courses = sum(self.course_run_data["Runs"])
-            
-            if total_courses > 500:
-                log_progress(f"Extremely large problem detected ({total_courses} courses) - applying maximum optimizations", 0.02)
-                # Maximum optimizations for extremely large problems
-                max_affinity_constraints = 0  # Disable affinity constraints completely
+            # Reduce affinity constraints 
+            max_affinity_constraints = max(10, max_affinity_constraints // 2)
+            # Simplify solution strategy for speed
+            if solution_strategy != "FIND_FEASIBLE_FAST":
                 solution_strategy = "FIND_FEASIBLE_FAST"
-                num_workers = min(32, os.cpu_count() or 8)  # Use all available CPU cores if possible
-                monthly_weight = 1  # Minimal monthly distribution weight
-                # Drastically shorten time limit
-                solver_time_minutes = min(solver_time_minutes, 5)
-                
-                # Apply sampling for extremely large problems - only optimize a subset of courses
-                if total_courses > 700:
-                    log_progress("Applying course sampling for enormous problem - will optimize in batches", 0.03)
-                    # We'll need to sample courses by sorting by priority and taking most important ones
-                    self.course_run_data = self._sample_courses_for_optimization(self.course_run_data, max_courses=500)
-                    log_progress(f"Reduced to {sum(self.course_run_data['Runs'])} highest priority courses", 0.04)
-                
-                log_progress("Maximum optimizations applied - sacrificing constraint quality for speed", 0.05)
-            elif total_courses > 300:
-                log_progress(f"Large problem detected ({total_courses} courses) - applying aggressive optimizations", 0.02)
-                # Very aggressive settings for large problems
-                max_affinity_constraints = max(3, max_affinity_constraints // 8)
-                solution_strategy = "FIND_FEASIBLE_FAST"
-                num_workers = min(16, num_workers * 2)
-                monthly_weight = monthly_weight // 4
-                min_course_spacing = 1  # Minimum possible spacing
-                # Shorten time limit to avoid excessive solving
-                solver_time_minutes = min(solver_time_minutes, 10)
-                log_progress("Aggressive optimizations applied for large problem", 0.03)
-            else:
-                # Standard optimizations for smaller problems
-                max_affinity_constraints = max(5, max_affinity_constraints // 4)
-                solution_strategy = "FIND_FEASIBLE_FAST"
-                num_workers = min(16, num_workers * 2)
-                monthly_weight = monthly_weight // 2
-                min_course_spacing = max(1, min_course_spacing - 1)
+            # Increase number of workers
+            num_workers = min(16, num_workers * 2)
+            # Simplify the monthly distribution objective
+            monthly_weight = monthly_weight // 2
 
         # Get total F2F runs
         log_progress("Starting optimization process...", 0.01)
@@ -360,7 +325,7 @@ class CourseScheduler:
         max_weeks = len(self.weekly_calendar)
 
         log_progress("Creating variables for courses and trainers...", 0.15)
-        
+
         # All penalty lists
         month_deviation_penalties = []
         affinity_penalties = []
@@ -371,86 +336,60 @@ class CourseScheduler:
         # Create the schedule variables for each course and run
         for _, row in self.course_run_data.iterrows():
             try:
-                course, delivery_type, language, runs, duration = row["Course Name"], row["Delivery Type"], row["Language"], \
-                    row["Runs"], row["Duration"]
+            course, delivery_type, language, runs, duration = row["Course Name"], row["Delivery Type"], row["Language"], \
+                row["Runs"], row["Duration"]
 
-                for i in range(runs):
-                    # Create a variable for the start week
-                    start_week = model.NewIntVar(1, max_weeks, f"start_week_{course}_{i}")
-                    schedule[(course, delivery_type, language, i)] = start_week
+            for i in range(runs):
+                # Create a variable for the start week
+                start_week = model.NewIntVar(1, max_weeks, f"start_week_{course}_{i}")
+                schedule[(course, delivery_type, language, i)] = start_week
 
-                    # If champions are prioritized and there is a champion for this course, 
-                    # prepare to add constraints after checking week availability
-                    use_champion = False
-                    champion_idx = -1
-                    
-                    if enforce_champions and (course, language) in self.course_champions:
-                        champion = self.course_champions.get((course, language))
-                        if champion in self.fleximatrix.get((course, language), []):
-                            # Get the index of the champion in the qualified trainers list
-                            champion_idx = self.fleximatrix.get((course, language)).index(champion)
-                            use_champion = True
-                            log_progress(f"Will prioritize champion {champion} for {course} ({language}) when available")
-                    
-                    # Create normal trainer assignment variable (we'll add champion constraints later)
-                    trainer_var = model.NewIntVar(0, len(self.fleximatrix.get((course, language), [])), f"trainer_{course}_{i}")
-                    trainer_assignments[(course, delivery_type, language, i)] = trainer_var
-                    
-                    # Only schedule in weeks with enough working days AND available trainers
-                    valid_weeks = []
-                    for w, days in self.weekly_working_days.items():
-                        if days >= duration:
-                            # WEEK RESTRICTION CHECK: Skip if this course can't run in this week position
-                            if course in self.week_restrictions:
-                                # Get week position info
-                                week_info = self.week_position_in_month.get(w, {})
+                # Create trainer assignment variable
+                qualified_trainers = self.fleximatrix.get((course, language), [])
+                if not qualified_trainers:
+                        log_progress(f"Warning: No qualified trainers for {course} ({language})")
+                    continue
 
-                                # Check each restriction type
-                                skip_week = False
+                trainer_var = model.NewIntVar(0, len(qualified_trainers) - 1, f"trainer_{course}_{i}")
+                trainer_assignments[(course, delivery_type, language, i)] = trainer_var
 
-                                if week_info.get('is_first') and self.week_restrictions[course].get('First', False):
-                                    skip_week = True
-                                elif week_info.get('is_second') and self.week_restrictions[course].get('Second', False):
-                                    skip_week = True
-                                elif week_info.get('is_third') and self.week_restrictions[course].get('Third', False):
-                                    skip_week = True
-                                elif week_info.get('is_fourth') and self.week_restrictions[course].get('Fourth', False):
-                                    skip_week = True
-                                elif week_info.get('is_last') and self.week_restrictions[course].get('Last', False):
-                                    skip_week = True
+                # Only schedule in weeks with enough working days AND available trainers
+                valid_weeks = []
+                for w, days in self.weekly_working_days.items():
+                    if days >= duration:
+                        # WEEK RESTRICTION CHECK: Skip if this course can't run in this week position
+                        if course in self.week_restrictions:
+                            # Get week position info
+                            week_info = self.week_position_in_month.get(w, {})
 
-                                if skip_week:
-                                    # Skip this week for this course due to restriction
-                                    continue
+                            # Check each restriction type
+                            skip_week = False
 
-                            # Check if at least one qualified trainer is available this week
-                            for trainer in self.fleximatrix.get((course, language), []):
-                                if self.is_trainer_available(trainer, w):
-                                    valid_weeks.append(w)
-                                    break
+                            if week_info.get('is_first') and self.week_restrictions[course].get('First', False):
+                                skip_week = True
+                            elif week_info.get('is_second') and self.week_restrictions[course].get('Second', False):
+                                skip_week = True
+                            elif week_info.get('is_third') and self.week_restrictions[course].get('Third', False):
+                                skip_week = True
+                            elif week_info.get('is_fourth') and self.week_restrictions[course].get('Fourth', False):
+                                skip_week = True
+                            elif week_info.get('is_last') and self.week_restrictions[course].get('Last', False):
+                                skip_week = True
 
-                    if valid_weeks:
-                        model.AddAllowedAssignments([start_week], [[w] for w in valid_weeks])
-                        
-                        # Now add champion constraints for each valid week if needed
-                        if use_champion and champion_idx >= 0:
-                            champion = self.fleximatrix.get((course, language))[champion_idx]
-                            
-                            # For each valid week, check if the champion is available
-                            for week in valid_weeks:
-                                if self.is_trainer_available(champion, week):
-                                    # Create a boolean variable that is true if this course is scheduled in this week
-                                    is_in_week = model.NewBoolVar(f"{course}_{i}_in_week_{week}")
-                                    model.Add(start_week == week).OnlyEnforceIf(is_in_week)
-                                    model.Add(start_week != week).OnlyEnforceIf(is_in_week.Not())
-                                    
-                                    # If the course is scheduled in this week, the trainer must be the champion
-                                    model.Add(trainer_var == champion_idx).OnlyEnforceIf(is_in_week)
-                                    
-                                    log_progress(f"Added constraint: If {course} run {i+1} is in week {week}, champion {champion} must teach it", None)
-                                    
-                    else:
-                        print(f"Warning: No valid weeks for {course} run {i + 1}")
+                            if skip_week:
+                                # Skip this week for this course due to restriction
+                                continue
+
+                        # Check if at least one qualified trainer is available this week
+                        for trainer in qualified_trainers:
+                            if self.is_trainer_available(trainer, w):
+                                valid_weeks.append(w)
+                                break
+
+                if valid_weeks:
+                    model.AddAllowedAssignments([start_week], [[w] for w in valid_weeks])
+                else:
+                    print(f"Warning: No valid weeks for {course} run {i + 1}")
             except Exception as e:
                 print(f"Error processing course {course}: {e}")
                 continue
@@ -675,7 +614,7 @@ class CourseScheduler:
 
             # Add penalty for being too close
             for _ in range(affinity_weight):
-                affinity_penalties.append(too_close)
+            affinity_penalties.append(too_close)
 
             print(f"  Added affinity constraint: {c1} and {c2} should be {gap_weeks} weeks apart (reduced to {reduced_gap} in Q4)")
             
@@ -765,13 +704,23 @@ class CourseScheduler:
                 model.Add(total_workload == sum(weighted_terms))
                 # Enforce maximum workload
                 model.Add(total_workload <= max_days)
-                
-                # Add hard constraint for minimum utilization if specified
-                min_days = max(1, int(max_days * utilization_target / 100))  # Convert percentage to days
-                if min_days > 0:
-                    # Commenting out the hard constraint as requested
-                    # model.Add(total_workload >= min_days)
-                    log_progress(f"Skipping minimum utilization constraint for Trainer {trainer} (would be {min_days} days)")
+
+                # 4.4: For non-freelancers, encourage higher utilization (soft constraint)
+                if not self.is_freelancer(trainer):
+                    # Calculate target utilization as a percentage of max days
+                    target_days = int(max_days * (utilization_target / 100))  # Use the parameter
+
+                    # Add penalty for underutilization
+                    under_target = model.NewBoolVar(f"{trainer}_under_target")
+                    model.Add(total_workload < target_days).OnlyEnforceIf(under_target)
+                    model.Add(total_workload >= target_days).OnlyEnforceIf(under_target.Not())
+
+                    # Higher priority trainers get stronger penalty for underutilization
+                    priority = self.get_trainer_priority(trainer)
+                    penalty_weight = 7 - priority  # Invert priority (1 becomes 6, 6 becomes 1)
+
+                    for _ in range(penalty_weight):
+                        trainer_utilization_penalties.append(under_target)
 
         # NEW CODE: Add constraint to prevent trainers from teaching multiple courses in same week
         # Add this right after the trainer workload constraints
@@ -897,66 +846,66 @@ class CourseScheduler:
             # and adjust other weights to allow more flexibility
             unscheduled_weight = 20  # Very high weight to make this the top priority
             monthly_weight = monthly_weight // 2 if enforce_monthly_distribution else monthly_weight
+            champion_weight = champion_weight // 2
             min_course_spacing = max(1, min_course_spacing - 1)  # Reduce spacing requirements
 
             # Combined objective function with course scheduling priority
             model.Minimize(
                 unscheduled_weight * sum(unscheduled_course_penalties) +
                 monthly_weight * sum(month_deviation_penalties) +
-                affinity_weight * sum(affinity_penalties)
+                affinity_weight * sum(affinity_penalties) +
+                champion_weight * sum(champion_assignment_penalties) +
+                utilization_weight * sum(trainer_utilization_penalties)
             )
         else:
-            # Original objective function without champion and utilization penalties
+            # Original objective function
             model.Minimize(
                 monthly_weight * sum(month_deviation_penalties) +
-                affinity_weight * sum(affinity_penalties)
+                affinity_weight * sum(affinity_penalties) +
+                champion_weight * sum(champion_assignment_penalties) +
+                utilization_weight * sum(trainer_utilization_penalties)
             )
 
         # Initialize solver with customized parameters
         solver = cp_model.CpSolver()
+        solver.parameters.max_time_in_seconds = solver_time_minutes * 60  # Convert to seconds
+        solver.parameters.num_search_workers = num_workers
         
-        try:
-            # Base parameters that should work in all versions
-            solver.parameters.max_time_in_seconds = solver_time_minutes * 60  # Convert to seconds
-            solver.parameters.num_search_workers = num_workers
-            
-            # Try to set additional parameters that may only exist in newer versions
-            try:
-                solver.parameters.log_search_progress = True
-            except:
-                log_progress("Log search progress parameter not supported in this version", None)
-        except Exception as e:
-            log_progress(f"Warning: Some solver parameters could not be set: {str(e)}", None)
+        # Add additional parameters to enforce time limit more strictly
+        solver.parameters.log_search_progress = True
+        solver.parameters.interrupt_at_seconds = solver_time_minutes * 60  # Enforce hard time limit
         
-        # Create a simple solution counter callback instead of timeout
-        class SolutionCounter(cp_model.CpSolverSolutionCallback):
-            def __init__(self):
+        # Create a callback to track time
+        class TimeoutCallback(cp_model.CpSolverSolutionCallback):
+            def __init__(self, time_limit):
                 cp_model.CpSolverSolutionCallback.__init__(self)
-                self._solution_count = 0
+                self._time_limit = time_limit
                 self._start_time = datetime.datetime.now()
+                self._stop_search = False
+                self._first_solution_time = None
+                self._solution_count = 0
                 
             def on_solution_callback(self):
-                try:
-                    self._solution_count += 1
-                    current_time = datetime.datetime.now()
-                    elapsed_seconds = (current_time - self._start_time).total_seconds()
-                    
-                    if self._solution_count == 1:
-                        log_progress(f"First solution found in {elapsed_seconds:.1f} seconds", 0.75)
-                    elif self._solution_count % 10 == 0:  # Log every 10 solutions
-                        log_progress(f"Found {self._solution_count} solutions in {elapsed_seconds:.1f} seconds", 0.80)
-                except Exception as e:
-                    # Catch any errors in the callback to prevent crashes
-                    pass
+                self._solution_count += 1
+                current_time = datetime.datetime.now()
+                if not self._first_solution_time:
+                    self._first_solution_time = current_time
+                    log_progress(f"First solution found in {(current_time - self._start_time).total_seconds():.1f} seconds", 0.75)
                 
-            def solution_count(self):
-                return self._solution_count
+                # Stop after time limit
+                elapsed_seconds = (current_time - self._start_time).total_seconds()
+                if elapsed_seconds >= self._time_limit * 0.95:  # Stop at 95% of time limit to ensure we return on time
+                    log_progress(f"Time limit approaching, stopping search after {self._solution_count} solutions", 0.85)
+                    self._stop_search = True
+                    
+            def stop_search(self):
+                return self._stop_search
         
         log_progress(f"Configuring solver with {solver_time_minutes} minute time limit...", 0.60)
         
-        # Create and use solution counter
-        solution_counter = SolutionCounter()
-        
+        # Create and use the timeout callback
+        timeout_callback = TimeoutCallback(solver_time_minutes * 60)
+
         # Set solution strategy
         if solution_strategy == "MAXIMIZE_QUALITY":
             solver.parameters.optimize_with_max_hs = True
@@ -966,59 +915,7 @@ class CourseScheduler:
 
         # Solve the model
         log_progress("Starting solver...", 0.65)
-        
-        # Create a separate thread to update status periodically
-        def status_updater():
-            start_time = datetime.datetime.now()
-            update_interval = 10  # seconds
-            while not solver_done:
-                # Sleep for a bit
-                time.sleep(update_interval)
-                
-                # Calculate elapsed time
-                elapsed_time = (datetime.datetime.now() - start_time).total_seconds()
-                minutes = int(elapsed_time // 60)
-                seconds = int(elapsed_time % 60)
-                
-                # Update status
-                log_progress(f"Optimizer still running ({minutes}m {seconds}s elapsed, max {solver_time_minutes}m)...", 
-                           0.70 + min(0.15, elapsed_time / (solver_time_minutes * 60) * 0.15))
-                
-                # Check if we're approaching the time limit
-                if elapsed_time >= solver_time_minutes * 60 * 0.9:  # 90% of time limit
-                    log_progress("Approaching time limit, preparing to return best solution found", 0.85)
-                
-                # Adjust update interval as time progresses
-                update_interval = min(30, update_interval + 5)  # gradually increase interval up to 30 seconds
-        
-        # Flag to signal when solver is done
-        solver_done = False
-        
-        # Start the status update thread
-        status_thread = threading.Thread(target=status_updater)
-        status_thread.daemon = True  # Thread will exit when main thread exits
-        status_thread.start()
-        
-        try:
-            # For extremely large problems, try a simpler approach first
-            if accelerated_mode and sum(self.course_run_data["Runs"]) > 500:
-                log_progress("Using simplified solver approach for extremely large problem", 0.70)
-                # Don't use callback for very large problems - it can cause crashes
-                status = solver.Solve(model)
-            else:
-                # Use callback for normal-sized problems
-                status = solver.Solve(model, solution_counter)
-        except Exception as e:
-            log_progress(f"Error during solving: {str(e)}", 0.85)
-            # Try again without the callback as a fallback
-            log_progress("Retrying without custom callback...", 0.86)
-            status = solver.Solve(model)
-        finally:
-            # Signal the status thread to stop
-            solver_done = True
-            # Wait for the thread to actually stop
-            time.sleep(0.5)
-            
+        status = solver.Solve(model, timeout_callback)
         log_progress("Solver completed", 0.90)
 
         # Print status information
@@ -1035,22 +932,22 @@ class CourseScheduler:
 
             for (course, delivery_type, language, i), week_var in schedule.items():
                 try:
-                    total_courses += 1
-                    assigned_week = solver.Value(week_var)
-                    if assigned_week > 0:  # Course was scheduled
-                        scheduled_courses += 1
-                        start_date = self.weekly_calendar[assigned_week - 1].strftime("%Y-%m-%d")
+                total_courses += 1
+                assigned_week = solver.Value(week_var)
+                if assigned_week > 0:  # Course was scheduled
+                    scheduled_courses += 1
+                    start_date = self.weekly_calendar[assigned_week - 1].strftime("%Y-%m-%d")
 
                         # Get trainer assignment if it exists
-                        if (course, delivery_type, language, i) in trainer_assignments:
-                            trainer_var = trainer_assignments[(course, delivery_type, language, i)]
-                            trainer_idx = solver.Value(trainer_var)
-                            
+                if (course, delivery_type, language, i) in trainer_assignments:
+                    trainer_var = trainer_assignments[(course, delivery_type, language, i)]
+                    trainer_idx = solver.Value(trainer_var)
+
                             # Check if this course has qualified trainers in the fleximatrix
                             if (course, language) in self.fleximatrix and len(self.fleximatrix[(course, language)]) > 0:
-                                if 0 <= trainer_idx < len(self.fleximatrix[(course, language)]):
-                                    trainer = self.fleximatrix[(course, language)][trainer_idx]
-                                    is_champion = "✓" if self.course_champions.get((course, language)) == trainer else " "
+                    if 0 <= trainer_idx < len(self.fleximatrix[(course, language)]):
+                        trainer = self.fleximatrix[(course, language)][trainer_idx]
+                        is_champion = "✓" if self.course_champions.get((course, language)) == trainer else " "
                                 else:
                                     # Handle out of range index
                                     trainer = "Unknown (Index Error)"
@@ -1060,15 +957,15 @@ class CourseScheduler:
                                 trainer = "No Qualified Trainers"
                                 is_champion = " "
 
-                            schedule_results.append({
-                                "Week": assigned_week,
-                                "Start Date": start_date,
-                                "Course": course,
-                                "Delivery Type": delivery_type,
-                                "Language": language,
-                                "Run": i + 1,
-                                "Trainer": trainer,
-                                "Champion": is_champion
+                        schedule_results.append({
+                            "Week": assigned_week,
+                            "Start Date": start_date,
+                            "Course": course,
+                            "Delivery Type": delivery_type,
+                            "Language": language,
+                            "Run": i + 1,
+                            "Trainer": trainer,
+                            "Champion": is_champion
                             })
 
                     else:  # Course wasn't scheduled
@@ -1087,7 +984,7 @@ class CourseScheduler:
                         "Language": language,
                         "Run": i + 1,
                         "Error": str(e)
-                    })
+                        })
 
             # Convert to DataFrame
             schedule_df = pd.DataFrame(schedule_results)
@@ -1475,13 +1372,23 @@ class CourseScheduler:
                 model.Add(total_workload == sum(weighted_terms))
                 # Enforce maximum workload
                 model.Add(total_workload <= max_days)
-                
-                # Add hard constraint for minimum utilization if specified
-                min_days = max(1, int(max_days * utilization_target / 100))  # Convert percentage to days
-                if min_days > 0:
-                    # Commenting out the hard constraint as requested
-                    # model.Add(total_workload >= min_days)
-                    log_progress(f"Skipping minimum utilization constraint for Trainer {trainer} (would be {min_days} days)")
+
+                # For non-freelancers, encourage higher utilization
+                if not self.is_freelancer(trainer):
+                    # Calculate target utilization as a percentage of max days
+                    target_days = int(max_days * (70 / 100))  # 70% target
+
+                    # Add penalty for underutilization
+                    under_target = model.NewBoolVar(f"{trainer}_under_target")
+                    model.Add(total_workload < target_days).OnlyEnforceIf(under_target)
+                    model.Add(total_workload >= target_days).OnlyEnforceIf(under_target.Not())
+
+                    # Higher priority trainers get stronger penalty
+                    priority = self.get_trainer_priority(trainer)
+                    penalty_weight = 7 - priority  # Invert priority (1 becomes 6, 6 becomes 1)
+
+                    for _ in range(penalty_weight):
+                        trainer_utilization_penalties.append(under_target)
 
         # Objective function
         model.Minimize(
@@ -1508,19 +1415,19 @@ class CourseScheduler:
             schedule_results = []
             for (course, delivery_type, language, i), week_var in schedule.items():
                 try:
-                    assigned_week = solver.Value(week_var)
-                    start_date = self.weekly_calendar[assigned_week - 1].strftime("%Y-%m-%d")
+                assigned_week = solver.Value(week_var)
+                start_date = self.weekly_calendar[assigned_week - 1].strftime("%Y-%m-%d")
 
                     # Get trainer assignment if it exists
-                    if (course, delivery_type, language, i) in trainer_assignments:
-                        trainer_var = trainer_assignments[(course, delivery_type, language, i)]
-                        trainer_idx = solver.Value(trainer_var)
+                if (course, delivery_type, language, i) in trainer_assignments:
+                    trainer_var = trainer_assignments[(course, delivery_type, language, i)]
+                    trainer_idx = solver.Value(trainer_var)
 
                         # Check if this course has qualified trainers in the fleximatrix
                         if (course, language) in self.fleximatrix and len(self.fleximatrix[(course, language)]) > 0:
-                            if 0 <= trainer_idx < len(self.fleximatrix[(course, language)]):
-                                trainer = self.fleximatrix[(course, language)][trainer_idx]
-                                is_champion = "✓" if self.course_champions.get((course, language)) == trainer else " "
+                    if 0 <= trainer_idx < len(self.fleximatrix[(course, language)]):
+                        trainer = self.fleximatrix[(course, language)][trainer_idx]
+                        is_champion = "✓" if self.course_champions.get((course, language)) == trainer else " "
                             else:
                                 # Handle out of range index
                                 trainer = "Unknown (Index Error)"
@@ -1550,7 +1457,7 @@ class CourseScheduler:
                         "Language": language,
                         "Run": i + 1,
                         "Error": str(e)
-                    })
+                        })
 
             # Convert to DataFrame
             schedule_df = pd.DataFrame(schedule_results)
@@ -1840,27 +1747,27 @@ class CourseScheduler:
 
         for (course, delivery_type, language, i), week_var in schedule.items():
             try:
-                duration = self.course_run_data.loc[self.course_run_data["Course Name"] == course, "Duration"].iloc[0]
+            duration = self.course_run_data.loc[self.course_run_data["Course Name"] == course, "Duration"].iloc[0]
 
-                # Get trainer assignment
+            # Get trainer assignment
                 if (course, delivery_type, language, i) not in trainer_assignments:
                     continue
                 
-                trainer_var = trainer_assignments[(course, delivery_type, language, i)]
-                trainer_idx = solver.Value(trainer_var)
+            trainer_var = trainer_assignments[(course, delivery_type, language, i)]
+            trainer_idx = solver.Value(trainer_var)
 
                 # Check if this course has an entry in the fleximatrix
                 if (course, language) not in self.fleximatrix:
                     continue
-                
-                if 0 <= trainer_idx < len(self.fleximatrix[(course, language)]):
-                    trainer = self.fleximatrix[(course, language)][trainer_idx]
-                    trainer_days[trainer] += duration
-                    trainer_courses[trainer] += 1
 
-                    # Check if this is a champion course
-                    if self.course_champions.get((course, language)) == trainer:
-                        champion_courses[trainer] += 1
+            if 0 <= trainer_idx < len(self.fleximatrix[(course, language)]):
+                trainer = self.fleximatrix[(course, language)][trainer_idx]
+                trainer_days[trainer] += duration
+                trainer_courses[trainer] += 1
+
+                # Check if this is a champion course
+                if self.course_champions.get((course, language)) == trainer:
+                    champion_courses[trainer] += 1
             except Exception as e:
                 print(f"Error in utilization report for {course} (run {i+1}): {e}")
                 continue
@@ -2476,89 +2383,6 @@ class CourseScheduler:
 
         return analysis
 
-    def _sample_courses_for_optimization(self, course_df, max_courses=500):
-        """Sample the most important courses for optimization when dealing with extremely large problems"""
-        # Make a copy to avoid modifying the original dataframe
-        df = course_df.copy()
-        
-        # Calculate the total runs before sampling
-        total_runs_before = df["Runs"].sum()
-        
-        # Count total runs so far
-        total_runs = 0
-        
-        # Dictionary to track which courses to keep
-        courses_to_keep = {}
-        
-        # First pass: Sort courses by importance criteria
-        # Priority 1: Required courses (you can define what makes a course "required")
-        # Priority 2: Courses with champions assigned
-        # Priority 3: Courses with the most qualified trainers
-        
-        # Create a scoring system for course importance
-        scored_courses = []
-        for _, row in df.iterrows():
-            course = row["Course Name"]
-            language = row["Language"]
-            runs = row["Runs"]
-            
-            # Skip courses we've already decided on
-            if (course, language) in courses_to_keep:
-                continue
-                
-            # Calculate a score for this course (higher is more important)
-            score = 0
-            
-            # Check if it has a champion (courses with champions get priority)
-            if (course, language) in self.course_champions:
-                score += 100
-                
-            # Check how many qualified trainers it has (more trainers = more flexibility)
-            trainer_count = len(self.fleximatrix.get((course, language), []))
-            score += min(trainer_count * 5, 50)  # Cap at 50 points
-            
-            # Add the course to our scoring list
-            scored_courses.append({
-                "course": course,
-                "language": language,
-                "runs": runs,
-                "score": score,
-                "row_idx": _
-            })
-        
-        # Sort courses by score (highest first)
-        scored_courses.sort(key=lambda x: x["score"], reverse=True)
-        
-        # Find the row indices to keep
-        indices_to_keep = []
-        
-        # Take courses until we reach max_courses
-        for course_info in scored_courses:
-            if total_runs + course_info["runs"] <= max_courses:
-                indices_to_keep.append(course_info["row_idx"])
-                total_runs += course_info["runs"]
-            else:
-                # If including all runs would exceed our limit, 
-                # reduce the number of runs for this course
-                remaining = max_courses - total_runs
-                if remaining > 0:
-                    # Create a modified row with reduced runs
-                    reduced_row = df.loc[course_info["row_idx"]].copy()
-                    reduced_row["Runs"] = remaining
-                    # Add this row to a list of modified rows to append later
-                    df.at[course_info["row_idx"], "Runs"] = remaining
-                    indices_to_keep.append(course_info["row_idx"])
-                    total_runs += remaining
-                break
-        
-        # Filter the dataframe
-        sampled_df = df.loc[indices_to_keep].copy().reset_index(drop=True)
-        
-        # Add a note about how many courses were dropped
-        print(f"Sampling: Reduced from {total_runs_before} to {sampled_df['Runs'].sum()} total course runs")
-        
-        return sampled_df
-
 
 # Create Streamlit application
 def main():
@@ -2760,6 +2584,10 @@ def main():
                     st.markdown('<div class="slider-header">Priority Weights</div>', unsafe_allow_html=True)
                     monthly_weight = st.slider("Monthly Distribution Priority", 1, 10, 5,
                                                help="Higher values enforce monthly targets more strictly")
+                    champion_weight = st.slider("Champion Assignment Priority", 1, 10, 4,
+                                                help="Higher values prioritize assigning course champions")
+                    utilization_weight = st.slider("Trainer Utilization Priority", 1, 10, 3,
+                                                   help="Higher values encourage higher trainer utilization")
                     affinity_weight = st.slider("Course Affinity Priority", 1, 10, 2,
                                                 help="Higher values enforce gaps between related courses")
                     st.markdown('</div>', unsafe_allow_html=True)
@@ -2785,8 +2613,8 @@ def main():
                     max_affinity = st.slider(
                         "Maximum Affinity Constraints",
                         min_value=10,
-                        max_value=700,
-                        value=200,
+                        max_value=200,
+                        value=50,
                         help="Limit the number of course affinity constraints to reduce memory usage"
                     )
                     st.markdown('</div>', unsafe_allow_html=True)
@@ -2818,6 +2646,12 @@ def main():
                         help="Enable faster optimization with simplified model (use if regular optimization is too slow)"
                     )
 
+                    solution_strategy = st.selectbox(
+                        "Solution Strategy",
+                        options=["BALANCED", "MAXIMIZE_QUALITY", "FIND_FEASIBLE_FAST"],
+                        index=0,
+                        help="BALANCED = Default, MAXIMIZE_QUALITY = Best solution but slower, FIND_FEASIBLE_FAST = Any valid solution quickly"
+                    )
                     solver_time = st.slider(
                         "Solver Time Limit (minutes)",
                         min_value=1,
@@ -2879,47 +2713,48 @@ def main():
                                     displayed_msgs = log_messages[-15:]
                                     log_area.markdown('\n\n'.join(displayed_msgs))
                             
-                            with st.spinner(f"Running optimization (maximum time: {solver_time} minutes)..."):
-                                status, schedule_df, solver, schedule, trainer_assignments, unscheduled_courses = st.session_state.scheduler.run_optimization(
-                                    monthly_weight=monthly_weight,
-                                    affinity_weight=affinity_weight,
-                                    utilization_target=utilization_target,
-                                    solver_time_minutes=solver_time,
-                                    num_workers=num_workers,
-                                    min_course_spacing=min_course_spacing,
-                                    solution_strategy="BALANCED", # Default to balanced strategy
-                                    enforce_monthly_distribution=enforce_monthly,
-                                    max_affinity_constraints=max_affinity,
+                        with st.spinner(f"Running optimization (maximum time: {solver_time} minutes)..."):
+                            status, schedule_df, solver, schedule, trainer_assignments, unscheduled_courses = st.session_state.scheduler.run_optimization(
+                                monthly_weight=monthly_weight,
+                                champion_weight=0 if not enforce_champions else champion_weight,
+                                utilization_weight=utilization_weight,
+                                affinity_weight=affinity_weight,
+                                utilization_target=utilization_target,
+                                solver_time_minutes=solver_time,
+                                num_workers=num_workers,
+                                min_course_spacing=min_course_spacing,
+                                solution_strategy=solution_strategy,
+                                enforce_monthly_distribution=enforce_monthly,
+                                max_affinity_constraints=max_affinity,
                                     prioritize_all_courses=prioritize_all_courses,
                                     accelerated_mode=accelerated_mode,
-                                    progress_callback=update_progress,  # Pass the progress callback
-                                    enforce_champions=enforce_champions  # Pass the enforce_champions parameter
-                                )
+                                    progress_callback=update_progress  # Pass the progress callback
+                            )
 
-                                # Store the optimization status in session state
-                                st.session_state.optimization_status = status
-                                st.session_state.unscheduled_courses = unscheduled_courses if unscheduled_courses else []
+                            # Store the optimization status in session state
+                            st.session_state.optimization_status = status
+                            st.session_state.unscheduled_courses = unscheduled_courses if unscheduled_courses else []
 
-                                # Check if the optimization was successful
-                                if status in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
-                                    # Store results in session state
-                                    st.session_state.schedule_df = schedule_df
+                            # Check if the optimization was successful
+                            if status in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
+                                # Store results in session state
+                                st.session_state.schedule_df = schedule_df
 
-                                    # Generate the validation and utilization reports
-                                    st.session_state.validation_df = st.session_state.scheduler.generate_monthly_validation(
-                                        schedule, solver)
-                                    st.session_state.utilization_df = st.session_state.scheduler.generate_trainer_utilization_report(
-                                        schedule, trainer_assignments, solver)
+                                # Generate the validation and utilization reports
+                                st.session_state.validation_df = st.session_state.scheduler.generate_monthly_validation(
+                                    schedule, solver)
+                                st.session_state.utilization_df = st.session_state.scheduler.generate_trainer_utilization_report(
+                                    schedule, trainer_assignments, solver)
 
-                                    # Display success message with unscheduled course info
-                                    if st.session_state.unscheduled_courses:
-                                        st.warning(
-                                            f"Optimization completed with {len(st.session_state.unscheduled_courses)} unscheduled courses. See Results tab for details.")
-                                    else:
-                                        st.success("Optimization completed successfully! All courses were scheduled.")
+                                # Display success message with unscheduled course info
+                                if st.session_state.unscheduled_courses:
+                                    st.warning(
+                                        f"Optimization completed with {len(st.session_state.unscheduled_courses)} unscheduled courses. See Results tab for details.")
                                 else:
-                                    st.error(
-                                        f"Optimization failed with status: {solver.StatusName(status)}. Try adjusting your parameters or check the Debug tab.")
+                                    st.success("Optimization completed successfully! All courses were scheduled.")
+                            else:
+                                st.error(
+                                    f"Optimization failed with status: {solver.StatusName(status)}. Try adjusting your parameters or check the Debug tab.")
                         except Exception as e:
                             st.error(f"An error occurred: {e}")
                             logging.error(f"Optimization error: {str(e)}")
@@ -2965,15 +2800,14 @@ def main():
                                         "No optimization results found. Running a quick optimization to generate visualizations...")
                                     # Run a quick new optimization just to get solver state and schedule objects
                                     status, schedule_df, solver, schedule, trainer_assignments, _ = st.session_state.scheduler.run_optimization(
-                                        monthly_weight=5,
-                                        affinity_weight=2,
+                                        monthly_weight=5, champion_weight=4,
+                                        utilization_weight=3, affinity_weight=2,
                                         utilization_target=70, solver_time_minutes=1,
                                         num_workers=8, min_course_spacing=2,
                                         solution_strategy="FIND_FEASIBLE_FAST",
                                         enforce_monthly_distribution=False,
                                         prioritize_all_courses=False,
-                                        accelerated_mode=True,
-                                        enforce_champions=True
+                                        accelerated_mode=True
                                     )
 
                                     if status not in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
@@ -2987,15 +2821,14 @@ def main():
                                     # but use the existing solution as a starting point
                                     st.info("Using existing optimization results for visualization...")
                                     status, _, solver, schedule, trainer_assignments, _ = st.session_state.scheduler.run_optimization(
-                                        monthly_weight=5, 
-                                        affinity_weight=2,
+                                        monthly_weight=5, champion_weight=4,
+                                        utilization_weight=3, affinity_weight=2,
                                         utilization_target=70, solver_time_minutes=0.1,  # Very short time
                                         num_workers=8, min_course_spacing=2,
                                         solution_strategy="FIND_FEASIBLE_FAST",
                                         enforce_monthly_distribution=False,
                                         prioritize_all_courses=False,
-                                        accelerated_mode=True,
-                                        enforce_champions=True
+                                        accelerated_mode=True
                                     )
 
                                 # Rest of the visualization code stays the same...
