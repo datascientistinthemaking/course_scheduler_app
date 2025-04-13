@@ -261,6 +261,7 @@ class CourseScheduler:
                          enforce_monthly_distribution=False,
                          max_affinity_constraints=50,
                          prioritize_all_courses=False,
+                         accelerated_mode=False,
                          progress_callback=None):  # Add progress callback parameter
 
         # Helper function to log and update progress
@@ -274,6 +275,19 @@ class CourseScheduler:
                 else:
                     progress_callback(percent, message)
         
+        # Apply accelerated mode optimizations if enabled
+        if accelerated_mode:
+            log_progress("Running in accelerated mode - applying speed optimizations...", 0.01)
+            # Reduce affinity constraints 
+            max_affinity_constraints = max(10, max_affinity_constraints // 2)
+            # Simplify solution strategy for speed
+            if solution_strategy != "FIND_FEASIBLE_FAST":
+                solution_strategy = "FIND_FEASIBLE_FAST"
+            # Increase number of workers
+            num_workers = min(16, num_workers * 2)
+            # Simplify the monthly distribution objective
+            monthly_weight = monthly_weight // 2
+            
         # Get total F2F runs
         log_progress("Starting optimization process...", 0.01)
         total_f2f_runs = sum(self.course_run_data["Runs"])
@@ -856,6 +870,41 @@ class CourseScheduler:
         solver = cp_model.CpSolver()
         solver.parameters.max_time_in_seconds = solver_time_minutes * 60  # Convert to seconds
         solver.parameters.num_search_workers = num_workers
+        
+        # Add additional parameters to enforce time limit more strictly
+        solver.parameters.log_search_progress = True
+        solver.parameters.interrupt_at_seconds = solver_time_minutes * 60  # Enforce hard time limit
+        
+        # Create a callback to track time
+        class TimeoutCallback(cp_model.CpSolverSolutionCallback):
+            def __init__(self, time_limit):
+                cp_model.CpSolverSolutionCallback.__init__(self)
+                self._time_limit = time_limit
+                self._start_time = datetime.datetime.now()
+                self._stop_search = False
+                self._first_solution_time = None
+                self._solution_count = 0
+                
+            def on_solution_callback(self):
+                self._solution_count += 1
+                current_time = datetime.datetime.now()
+                if not self._first_solution_time:
+                    self._first_solution_time = current_time
+                    log_progress(f"First solution found in {(current_time - self._start_time).total_seconds():.1f} seconds", 0.75)
+                
+                # Stop after time limit
+                elapsed_seconds = (current_time - self._start_time).total_seconds()
+                if elapsed_seconds >= self._time_limit * 0.95:  # Stop at 95% of time limit to ensure we return on time
+                    log_progress(f"Time limit approaching, stopping search after {self._solution_count} solutions", 0.85)
+                    self._stop_search = True
+                    
+            def stop_search(self):
+                return self._stop_search
+        
+        log_progress(f"Configuring solver with {solver_time_minutes} minute time limit...", 0.60)
+        
+        # Create and use the timeout callback
+        timeout_callback = TimeoutCallback(solver_time_minutes * 60)
 
         # Set solution strategy
         if solution_strategy == "MAXIMIZE_QUALITY":
@@ -865,7 +914,9 @@ class CourseScheduler:
             solver.parameters.optimize_with_core = False
 
         # Solve the model
-        status = solver.Solve(model)
+        log_progress("Starting solver...", 0.65)
+        status = solver.Solve(model, timeout_callback)
+        log_progress("Solver completed", 0.90)
 
         # Print status information
         print(f"Solver status: {solver.StatusName(status)}")
@@ -2588,6 +2639,12 @@ def main():
                         value=False,
                         help="When enabled, the optimizer will prioritize scheduling all courses, potentially at the expense of other goals"
                     )
+                    
+                    accelerated_mode = st.checkbox(
+                        "Accelerated Mode",
+                        value=False,
+                        help="Enable faster optimization with simplified model (use if regular optimization is too slow)"
+                    )
 
                     solution_strategy = st.selectbox(
                         "Solution Strategy",
@@ -2670,6 +2727,7 @@ def main():
                                     enforce_monthly_distribution=enforce_monthly,
                                     max_affinity_constraints=max_affinity,
                                     prioritize_all_courses=prioritize_all_courses,
+                                    accelerated_mode=accelerated_mode,
                                     progress_callback=update_progress  # Pass the progress callback
                                 )
 
@@ -2748,7 +2806,8 @@ def main():
                                         num_workers=8, min_course_spacing=2,
                                         solution_strategy="FIND_FEASIBLE_FAST",
                                         enforce_monthly_distribution=False,
-                                        prioritize_all_courses=False
+                                        prioritize_all_courses=False,
+                                        accelerated_mode=True
                                     )
 
                                     if status not in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
@@ -2768,7 +2827,8 @@ def main():
                                         num_workers=8, min_course_spacing=2,
                                         solution_strategy="FIND_FEASIBLE_FAST",
                                         enforce_monthly_distribution=False,
-                                        prioritize_all_courses=False
+                                        prioritize_all_courses=False,
+                                        accelerated_mode=True
                                     )
 
                                 # Rest of the visualization code stays the same...
