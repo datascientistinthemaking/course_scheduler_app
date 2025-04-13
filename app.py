@@ -5,6 +5,10 @@ st.set_page_config(page_title="Course Scheduler", layout="wide")
 import matplotlib.pyplot as plt
 from ortools.sat.python import cp_model
 import logging
+from openpyxl import Workbook
+from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+from openpyxl.drawing.image import Image
 
 # Set up logging at the beginning of your app.py
 logging.basicConfig(level=logging.ERROR)
@@ -1754,9 +1758,15 @@ class CourseScheduler:
     def generate_excel_report(self, schedule_df, monthly_validation_df, trainer_utilization_df):
         """Generate an Excel report with multiple sheets containing all results"""
         import io
+        from openpyxl import Workbook
+        from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+        from openpyxl.utils import get_column_letter
+        from openpyxl.drawing.image import Image
+        
         output = io.BytesIO()
 
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            # Write the standard sheets as before
             if schedule_df is not None:
                 schedule_df.to_excel(writer, sheet_name='Schedule', index=False)
             else:
@@ -1774,6 +1784,145 @@ class CourseScheduler:
             else:
                 pd.DataFrame(columns=["No data available"]).to_excel(writer, sheet_name='Trainer Utilization',
                                                                      index=False)
+            
+            # Create the new Calendar View sheet
+            if schedule_df is not None and not schedule_df.empty:
+                # Get all trainers from the consultant data
+                trainers = self.consultant_data["Name"].tolist()
+                
+                # Create a new dataframe with trainers as rows
+                calendar_data = []
+                for trainer in trainers:
+                    calendar_data.append({"Trainer": trainer})
+                
+                calendar_df = pd.DataFrame(calendar_data)
+                
+                # Add the dataframe to the Excel but we'll manually format it later
+                calendar_df.to_excel(writer, sheet_name='Calendar View', index=False)
+                
+                # Get the worksheet and workbook objects
+                worksheet = writer.sheets['Calendar View']
+                workbook = writer.book
+                
+                # Define fill colors
+                light_green_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")  # Assigned
+                dark_green_fill = PatternFill(start_color="006100", end_color="006100", fill_type="solid")   # Champion
+                red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")         # Vacation
+                purple_fill = PatternFill(start_color="CCC0DA", end_color="CCC0DA", fill_type="solid")      # Holiday
+                
+                # Create header row with week start dates
+                for col_idx, week_start_date in enumerate(self.weekly_calendar, start=2):
+                    # Format date as DD-MMM
+                    formatted_date = week_start_date.strftime("%d-%b")
+                    week_num = col_idx - 1  # Adjusted for Excel column indexing
+                    
+                    # Write the date to the header
+                    cell = worksheet.cell(row=1, column=col_idx)
+                    cell.value = formatted_date
+                    cell.alignment = Alignment(horizontal='center', vertical='center')
+                    cell.font = Font(bold=True)
+                    
+                    # Format column width
+                    worksheet.column_dimensions[get_column_letter(col_idx)].width = 10
+                
+                # Create dictionary to track trainer assignments by week
+                trainer_assignments_by_week = {}
+                champion_assignments_by_week = {}
+                
+                # Process schedule data to get assignments
+                for _, row in schedule_df.iterrows():
+                    week = row['Week']
+                    trainer = row['Trainer']
+                    is_champion = row['Champion'].strip() == "✓"
+                    
+                    if (trainer, week) not in trainer_assignments_by_week:
+                        trainer_assignments_by_week[(trainer, week)] = 0
+                    
+                    trainer_assignments_by_week[(trainer, week)] += 1
+                    
+                    if is_champion:
+                        if (trainer, week) not in champion_assignments_by_week:
+                            champion_assignments_by_week[(trainer, week)] = 0
+                        
+                        champion_assignments_by_week[(trainer, week)] += 1
+                
+                # Process all trainers and weeks
+                for row_idx, trainer in enumerate(trainers, start=2):
+                    for col_idx, week_start_date in enumerate(self.weekly_calendar, start=2):
+                        week_num = col_idx - 1  # Adjusted for Excel column indexing
+                        cell = worksheet.cell(row=row_idx, column=col_idx)
+                        cell.alignment = Alignment(horizontal='center', vertical='center')
+                        
+                        # Check for public holidays
+                        has_public_holiday = False
+                        for _, holiday in self.public_holidays_data.iterrows():
+                            week_end_date = week_start_date + datetime.timedelta(days=4)  # 5-day work week
+                            if (holiday["Start Date"] <= week_end_date and holiday["End Date"] >= week_start_date):
+                                has_public_holiday = True
+                                break
+                        
+                        # Check for trainer vacation
+                        is_on_vacation = False
+                        for _, leave in self.annual_leaves[self.annual_leaves["Name"] == trainer].iterrows():
+                            week_end_date = week_start_date + datetime.timedelta(days=4)  # 5-day work week
+                            if (leave["Start_Date"] <= week_end_date and leave["End_Date"] >= week_start_date):
+                                is_on_vacation = True
+                                break
+                        
+                        # Check for trainer assignment
+                        is_assigned = (trainer, week_num) in trainer_assignments_by_week
+                        is_champion_assignment = (trainer, week_num) in champion_assignments_by_week
+                        
+                        # Apply appropriate fill and set value
+                        if is_on_vacation:
+                            cell.fill = red_fill
+                            cell.value = "Vacation"
+                        elif has_public_holiday:
+                            cell.fill = purple_fill
+                            cell.value = "Holiday"
+                        elif is_champion_assignment:
+                            cell.fill = dark_green_fill
+                            cell.value = "Champion"
+                            # White text for dark background
+                            cell.font = Font(color="FFFFFF")
+                        elif is_assigned:
+                            cell.fill = light_green_fill
+                            cell.value = "Assigned"
+                        else:
+                            cell.value = ""
+                
+                # Add a legend
+                legend_row = len(trainers) + 4
+                
+                worksheet.cell(row=legend_row, column=1).value = "Legend:"
+                worksheet.cell(row=legend_row, column=1).font = Font(bold=True)
+                
+                # Trainer assigned
+                worksheet.cell(row=legend_row + 1, column=1).value = "Light Green:"
+                worksheet.cell(row=legend_row + 1, column=2).value = "Trainer Assigned"
+                worksheet.cell(row=legend_row + 1, column=2).fill = light_green_fill
+                
+                # Champion assigned
+                worksheet.cell(row=legend_row + 2, column=1).value = "Dark Green:"
+                worksheet.cell(row=legend_row + 2, column=2).value = "Champion Assigned"
+                worksheet.cell(row=legend_row + 2, column=2).fill = dark_green_fill
+                worksheet.cell(row=legend_row + 2, column=2).font = Font(color="FFFFFF")
+                
+                # Vacation
+                worksheet.cell(row=legend_row + 3, column=1).value = "Red:"
+                worksheet.cell(row=legend_row + 3, column=2).value = "Trainer on Vacation"
+                worksheet.cell(row=legend_row + 3, column=2).fill = red_fill
+                
+                # Public holiday
+                worksheet.cell(row=legend_row + 4, column=1).value = "Purple:"
+                worksheet.cell(row=legend_row + 4, column=2).value = "Public Holiday"
+                worksheet.cell(row=legend_row + 4, column=2).fill = purple_fill
+                
+                # Adjust column width for trainer names
+                worksheet.column_dimensions['A'].width = 25
+            else:
+                # Create an empty calendar view if no schedule data
+                pd.DataFrame(columns=["No schedule data available"]).to_excel(writer, sheet_name='Calendar View', index=False)
 
         output.seek(0)
         return output
