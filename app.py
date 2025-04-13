@@ -263,7 +263,7 @@ class CourseScheduler:
         def log_progress(message, percent=None):
             print(message)
             if progress_callback:
-                progress_callback(percent, message) if percent is not None else None
+                progress_callback(percent, message) if percent is not None else progress_callback(None, message)
         
         # Get total F2F runs
         log_progress("Starting optimization process...", 0.01)
@@ -467,8 +467,16 @@ class CourseScheduler:
                 model.Add(var2 >= var1 + min_course_spacing)
 
         # CONSTRAINT 3: Add constraints for course affinities
+        log_progress("Adding affinity constraints for course pairs...", 0.50)
         print(f"Adding affinity constraints for course pairs")
+
+        # Define maximum affinity constraints to add (parameter)
+        affinity_count = 0
+        # Add constraints for course affinities (soft constraints/penalties)
         for _, row in self.affinity_matrix_data.iterrows():
+            if affinity_count >= max_affinity_constraints:
+                break
+
             c1, c2, gap_weeks = row["Course 1"], row["Course 2"], row["Gap Weeks"]
 
             c1_runs = []
@@ -480,13 +488,15 @@ class CourseScheduler:
                 elif course == c2:
                     c2_runs.append((i, var))
 
-            # Skip if either course not found in schedule (might have 0 runs)
+            # Skip if either course doesn't have any runs
             if not c1_runs or not c2_runs:
                 continue
 
-            # Sort by run number
+            # Sort by run index
             c1_runs.sort(key=lambda x: x[0])
             c2_runs.sort(key=lambda x: x[0])
+
+            affinity_count += 1
 
             # Only check first run of each course to reduce constraints
             run1, var1 = c1_runs[0]
@@ -506,6 +516,7 @@ class CourseScheduler:
                 model.Add(var1 == week).OnlyEnforceIf(is_in_this_week)
                 model.Add(var1 != week).OnlyEnforceIf(is_in_this_week.Not())
                 c1_q4_choices.append(is_in_this_week)
+
             model.AddBoolOr(c1_q4_choices).OnlyEnforceIf(is_c1_q4)
             model.AddBoolAnd([choice.Not() for choice in c1_q4_choices]).OnlyEnforceIf(is_c1_q4.Not())
 
@@ -516,11 +527,12 @@ class CourseScheduler:
                 model.Add(var2 == week).OnlyEnforceIf(is_in_this_week)
                 model.Add(var2 != week).OnlyEnforceIf(is_in_this_week.Not())
                 c2_q4_choices.append(is_in_this_week)
+
             model.AddBoolOr(c2_q4_choices).OnlyEnforceIf(is_c2_q4)
             model.AddBoolAnd([choice.Not() for choice in c2_q4_choices]).OnlyEnforceIf(is_c2_q4.Not())
 
-            # Either course in Q4 means reduced gap
-            either_in_q4 = model.NewBoolVar(f"{c1}_{c2}_either_in_q4")
+            # Either course is in Q4
+            either_in_q4 = model.NewBoolVar(f"either_{c1}_{c2}_in_q4")
             model.AddBoolOr([is_c1_q4, is_c2_q4]).OnlyEnforceIf(either_in_q4)
             model.AddBoolAnd([is_c1_q4.Not(), is_c2_q4.Not()]).OnlyEnforceIf(either_in_q4.Not())
 
@@ -537,28 +549,61 @@ class CourseScheduler:
             far_enough_before_q4 = model.NewBoolVar(f"far_before_{c1}_{c2}_{run1}_{run2}_q4")
 
             # Normal gap constraints
-            model.Add(var2 >= var1 + gap_weeks).OnlyEnforceIf([far_enough_after_normal, either_in_q4.Not()])
-            model.Add(var2 <= var1 - gap_weeks).OnlyEnforceIf([far_enough_before_normal, either_in_q4.Not()])
+            model.Add(var2 >= var1 + gap_weeks).OnlyEnforceIf(far_enough_after_normal)
+            model.Add(var2 < var1 + gap_weeks).OnlyEnforceIf(far_enough_after_normal.Not())
 
-            # Reduced gap constraints for Q4
-            model.Add(var2 >= var1 + reduced_gap).OnlyEnforceIf([far_enough_after_q4, either_in_q4])
-            model.Add(var2 <= var1 - reduced_gap).OnlyEnforceIf([far_enough_before_q4, either_in_q4])
+            model.Add(var1 >= var2 + gap_weeks).OnlyEnforceIf(far_enough_before_normal)
+            model.Add(var1 < var2 + gap_weeks).OnlyEnforceIf(far_enough_before_normal.Not())
 
-            # Combine normal and Q4 constraints
-            model.AddBoolOr([far_enough_after_normal, far_enough_before_normal]).OnlyEnforceIf([too_close.Not(), either_in_q4.Not()])
-            model.AddBoolOr([far_enough_after_q4, far_enough_before_q4]).OnlyEnforceIf([too_close.Not(), either_in_q4])
+            # Q4 gap constraints (reduced)
+            model.Add(var2 >= var1 + reduced_gap).OnlyEnforceIf(far_enough_after_q4)
+            model.Add(var2 < var1 + reduced_gap).OnlyEnforceIf(far_enough_after_q4.Not())
 
-            # Add violation constraints
-            model.Add(var2 < var1 + reduced_gap).OnlyEnforceIf([too_close, either_in_q4])
-            model.Add(var2 > var1 - reduced_gap).OnlyEnforceIf([too_close, either_in_q4])
-            model.Add(var2 < var1 + gap_weeks).OnlyEnforceIf([too_close, either_in_q4.Not()])
-            model.Add(var2 > var1 - gap_weeks).OnlyEnforceIf([too_close, either_in_q4.Not()])
+            model.Add(var1 >= var2 + reduced_gap).OnlyEnforceIf(far_enough_before_q4)
+            model.Add(var1 < var2 + reduced_gap).OnlyEnforceIf(far_enough_before_q4.Not())
 
-            affinity_penalties.append(too_close)
+            # Logic for too_close based on regular or Q4 gaps
+            # Not too close if:
+            # (NOT in Q4 AND (far enough apart in either direction))
+            # OR
+            # (In Q4 AND (far enough apart with reduced gap in either direction))
+            far_enough_normal = model.NewBoolVar(f"far_enough_{c1}_{c2}_{run1}_{run2}_normal")
+            model.AddBoolOr([far_enough_after_normal, far_enough_before_normal]).OnlyEnforceIf(far_enough_normal)
+            model.AddBoolAnd([far_enough_after_normal.Not(), far_enough_before_normal.Not()]).OnlyEnforceIf(
+                far_enough_normal.Not())
+
+            far_enough_q4 = model.NewBoolVar(f"far_enough_{c1}_{c2}_{run1}_{run2}_q4")
+            model.AddBoolOr([far_enough_after_q4, far_enough_before_q4]).OnlyEnforceIf(far_enough_q4)
+            model.AddBoolAnd([far_enough_after_q4.Not(), far_enough_before_q4.Not()]).OnlyEnforceIf(far_enough_q4.Not())
+
+            # Not too close if appropriate gap is maintained based on Q4 status
+            not_too_close_normal = model.NewBoolVar(f"not_too_close_normal_{c1}_{c2}_{run1}_{run2}")
+            model.AddBoolAnd([either_in_q4.Not(), far_enough_normal]).OnlyEnforceIf(not_too_close_normal)
+            model.AddBoolOr([either_in_q4, far_enough_normal.Not()]).OnlyEnforceIf(not_too_close_normal.Not())
+
+            not_too_close_q4 = model.NewBoolVar(f"not_too_close_q4_{c1}_{c2}_{run1}_{run2}")
+            model.AddBoolAnd([either_in_q4, far_enough_q4]).OnlyEnforceIf(not_too_close_q4)
+            model.AddBoolOr([either_in_q4.Not(), far_enough_q4.Not()]).OnlyEnforceIf(not_too_close_q4.Not())
+
+            # Final too_close logic
+            model.AddBoolOr([not_too_close_normal, not_too_close_q4]).OnlyEnforceIf(too_close.Not())
+            model.AddBoolAnd([not_too_close_normal.Not(), not_too_close_q4.Not()]).OnlyEnforceIf(too_close)
+
+            # Add penalty for being too close
+            for _ in range(affinity_weight):
+                affinity_penalties.append(too_close)
+
             print(f"  Added affinity constraint: {c1} and {c2} should be {gap_weeks} weeks apart (reduced to {reduced_gap} in Q4)")
+            
+            # Log each affinity constraint with shortened course names for readability
+            c1_short = c1[:40] + "..." if len(c1) > 40 else c1
+            c2_short = c2[:40] + "..." if len(c2) > 40 else c2
+            log_message = f"Added affinity constraint: {c1_short} and {c2_short} should be {gap_weeks} weeks apart (reduced to {reduced_gap} in Q4)"
+            log_progress(log_message)
 
         # CONSTRAINT 4: Trainer-specific constraints
-        print("Adding trainer assignment constraints")
+        log_progress("Adding trainer assignment constraints", 0.55)
+        log_progress("Adding constraint: trainer can only teach one course per week", 0.56)
 
         # 4.1: Trainer availability - only assign trainers who are available during the scheduled week
         for (course, delivery_type, language, i), week_var in schedule.items():
@@ -584,6 +629,10 @@ class CourseScheduler:
 
                         # Cannot have both is_this_week and is_this_trainer be true
                         model.AddBoolOr([is_this_week.Not(), is_this_trainer.Not()])
+
+        # If prioritize_all_courses is true, add that message
+        if prioritize_all_courses:
+            log_progress("Adding priority for scheduling all courses", 0.58)
 
         # 4.2: Workload limits - track and limit total days per trainer
         trainer_workload = {name: [] for name in self.consultant_data["Name"]}
@@ -2437,13 +2486,21 @@ def main():
                             
                             # Initialize progress bar and status text
                             progress_bar = progress_container.progress(0)
-                            status_text = output_container.empty()
-                            status_text.text("Initializing optimization...")
                             
-                            # Function to update progress and output
+                            # Create a scrollable text area for logs instead of just a single line
+                            with output_container:
+                                st.markdown("### Optimization Progress")
+                                log_area = st.empty()
+                                log_messages = ["Initializing optimization..."]
+                            
+                            # Function to update progress and output - now keeps a history of messages
                             def update_progress(percent, message):
                                 progress_bar.progress(percent)
-                                status_text.text(message)
+                                if message and message.strip():
+                                    log_messages.append(message)
+                                    # Display the last 15 messages (or all if fewer) to keep the display manageable
+                                    displayed_msgs = log_messages[-15:]
+                                    log_area.markdown('\n\n'.join(displayed_msgs))
                             
                             with st.spinner(f"Running optimization (maximum time: {solver_time} minutes)..."):
                                 status, schedule_df, solver, schedule, trainer_assignments, unscheduled_courses = st.session_state.scheduler.run_optimization(
