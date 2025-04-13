@@ -267,7 +267,12 @@ class CourseScheduler:
         def log_progress(message, percent=None):
             print(message)
             if progress_callback:
-                progress_callback(percent, message) if percent is not None else progress_callback(None, message)
+                # Always default to the most recent percent if none is provided
+                if percent is None:
+                    # Don't update progress bar if percent is None
+                    progress_callback(None, message)
+                else:
+                    progress_callback(percent, message)
         
         # Get total F2F runs
         log_progress("Starting optimization process...", 0.01)
@@ -1766,7 +1771,6 @@ class CourseScheduler:
         output = io.BytesIO()
 
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            # Write the standard sheets as before
             if schedule_df is not None:
                 schedule_df.to_excel(writer, sheet_name='Schedule', index=False)
             else:
@@ -2644,7 +2648,8 @@ def main():
                             
                             # Function to update progress and output - now keeps a history of messages
                             def update_progress(percent, message):
-                                progress_bar.progress(percent)
+                                if percent is not None:
+                                    progress_bar.progress(percent)
                                 if message and message.strip():
                                     log_messages.append(message)
                                     # Display the last 15 messages (or all if fewer) to keep the display manageable
