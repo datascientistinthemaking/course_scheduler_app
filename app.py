@@ -279,15 +279,19 @@ class CourseScheduler:
         if accelerated_mode:
             log_progress("Running in accelerated mode - applying speed optimizations...", 0.01)
             # Reduce affinity constraints 
-            max_affinity_constraints = max(10, max_affinity_constraints // 2)
+            max_affinity_constraints = max(5, max_affinity_constraints // 4)
             # Simplify solution strategy for speed
-            if solution_strategy != "FIND_FEASIBLE_FAST":
-                solution_strategy = "FIND_FEASIBLE_FAST"
+            solution_strategy = "FIND_FEASIBLE_FAST"
             # Increase number of workers
             num_workers = min(16, num_workers * 2)
             # Simplify the monthly distribution objective
             monthly_weight = monthly_weight // 2
-            
+            # Reduce other penalties
+            champion_weight = champion_weight // 2
+            utilization_weight = utilization_weight // 2
+            # Reduce spacing requirements
+            min_course_spacing = max(1, min_course_spacing - 1)
+
         # Get total F2F runs
         log_progress("Starting optimization process...", 0.01)
         total_f2f_runs = sum(self.course_run_data["Runs"])
@@ -868,12 +872,19 @@ class CourseScheduler:
 
         # Initialize solver with customized parameters
         solver = cp_model.CpSolver()
-        solver.parameters.max_time_in_seconds = solver_time_minutes * 60  # Convert to seconds
-        solver.parameters.num_search_workers = num_workers
         
-        # Add additional parameters to enforce time limit more strictly
-        solver.parameters.log_search_progress = True
-        solver.parameters.interrupt_at_seconds = solver_time_minutes * 60  # Enforce hard time limit
+        try:
+            # Base parameters that should work in all versions
+            solver.parameters.max_time_in_seconds = solver_time_minutes * 60  # Convert to seconds
+            solver.parameters.num_search_workers = num_workers
+            
+            # Try to set additional parameters that may only exist in newer versions
+            try:
+                solver.parameters.log_search_progress = True
+            except:
+                log_progress("Log search progress parameter not supported in this version", None)
+        except Exception as e:
+            log_progress(f"Warning: Some solver parameters could not be set: {str(e)}", None)
         
         # Create a callback to track time
         class TimeoutCallback(cp_model.CpSolverSolutionCallback):
@@ -915,7 +926,14 @@ class CourseScheduler:
 
         # Solve the model
         log_progress("Starting solver...", 0.65)
-        status = solver.Solve(model, timeout_callback)
+        try:
+            status = solver.Solve(model, timeout_callback)
+        except Exception as e:
+            log_progress(f"Error during solving: {str(e)}", 0.85)
+            # Try again without the callback as a fallback
+            log_progress("Retrying without custom timeout...", 0.86)
+            status = solver.Solve(model)
+            
         log_progress("Solver completed", 0.90)
 
         # Print status information
