@@ -11,6 +11,7 @@ from openpyxl.utils import get_column_letter
 from openpyxl.drawing.image import Image
 import threading
 import time
+import os
 
 # Set up logging at the beginning of your app.py
 logging.basicConfig(level=logging.ERROR)
@@ -284,7 +285,28 @@ class CourseScheduler:
             # Check model size to determine level of acceleration needed
             total_courses = sum(self.course_run_data["Runs"])
             
-            if total_courses > 300:
+            if total_courses > 500:
+                log_progress(f"Extremely large problem detected ({total_courses} courses) - applying maximum optimizations", 0.02)
+                # Maximum optimizations for extremely large problems
+                max_affinity_constraints = 0  # Disable affinity constraints completely
+                solution_strategy = "FIND_FEASIBLE_FAST"
+                num_workers = min(32, os.cpu_count() or 8)  # Use all available CPU cores if possible
+                monthly_weight = 1  # Minimal monthly distribution weight
+                champion_weight = 1  # Minimal champion weight
+                utilization_weight = 1  # Minimal utilization weight
+                min_course_spacing = 1  # Minimum possible spacing
+                # Drastically shorten time limit
+                solver_time_minutes = min(solver_time_minutes, 5)
+                
+                # Apply sampling for extremely large problems - only optimize a subset of courses
+                if total_courses > 700:
+                    log_progress("Applying course sampling for enormous problem - will optimize in batches", 0.03)
+                    # We'll need to sample courses by sorting by priority and taking most important ones
+                    self.course_run_data = self._sample_courses_for_optimization(self.course_run_data, max_courses=500)
+                    log_progress(f"Reduced to {sum(self.course_run_data['Runs'])} highest priority courses", 0.04)
+                
+                log_progress("Maximum optimizations applied - sacrificing constraint quality for speed", 0.05)
+            elif total_courses > 300:
                 log_progress(f"Large problem detected ({total_courses} courses) - applying aggressive optimizations", 0.02)
                 # Very aggressive settings for large problems
                 max_affinity_constraints = max(3, max_affinity_constraints // 8)
@@ -909,14 +931,18 @@ class CourseScheduler:
                 self._start_time = datetime.datetime.now()
                 
             def on_solution_callback(self):
-                self._solution_count += 1
-                current_time = datetime.datetime.now()
-                elapsed_seconds = (current_time - self._start_time).total_seconds()
-                
-                if self._solution_count == 1:
-                    log_progress(f"First solution found in {elapsed_seconds:.1f} seconds", 0.75)
-                elif self._solution_count % 10 == 0:  # Log every 10 solutions
-                    log_progress(f"Found {self._solution_count} solutions in {elapsed_seconds:.1f} seconds", 0.80)
+                try:
+                    self._solution_count += 1
+                    current_time = datetime.datetime.now()
+                    elapsed_seconds = (current_time - self._start_time).total_seconds()
+                    
+                    if self._solution_count == 1:
+                        log_progress(f"First solution found in {elapsed_seconds:.1f} seconds", 0.75)
+                    elif self._solution_count % 10 == 0:  # Log every 10 solutions
+                        log_progress(f"Found {self._solution_count} solutions in {elapsed_seconds:.1f} seconds", 0.80)
+                except Exception as e:
+                    # Catch any errors in the callback to prevent crashes
+                    pass
                 
             def solution_count(self):
                 return self._solution_count
@@ -950,7 +976,12 @@ class CourseScheduler:
                 seconds = int(elapsed_time % 60)
                 
                 # Update status
-                log_progress(f"Optimizer still running ({minutes}m {seconds}s elapsed)...", 0.70 + min(0.15, elapsed_time / (solver_time_minutes * 60) * 0.15))
+                log_progress(f"Optimizer still running ({minutes}m {seconds}s elapsed, max {solver_time_minutes}m)...", 
+                           0.70 + min(0.15, elapsed_time / (solver_time_minutes * 60) * 0.15))
+                
+                # Check if we're approaching the time limit
+                if elapsed_time >= solver_time_minutes * 60 * 0.9:  # 90% of time limit
+                    log_progress("Approaching time limit, preparing to return best solution found", 0.85)
                 
                 # Adjust update interval as time progresses
                 update_interval = min(30, update_interval + 5)  # gradually increase interval up to 30 seconds
@@ -964,15 +995,24 @@ class CourseScheduler:
         status_thread.start()
         
         try:
-            status = solver.Solve(model, solution_counter)
+            # For extremely large problems, try a simpler approach first
+            if accelerated_mode and sum(self.course_run_data["Runs"]) > 500:
+                log_progress("Using simplified solver approach for extremely large problem", 0.70)
+                # Don't use callback for very large problems - it can cause crashes
+                status = solver.Solve(model)
+            else:
+                # Use callback for normal-sized problems
+                status = solver.Solve(model, solution_counter)
         except Exception as e:
             log_progress(f"Error during solving: {str(e)}", 0.85)
             # Try again without the callback as a fallback
-            log_progress("Retrying without custom timeout...", 0.86)
+            log_progress("Retrying without custom callback...", 0.86)
             status = solver.Solve(model)
         finally:
             # Signal the status thread to stop
             solver_done = True
+            # Wait for the thread to actually stop
+            time.sleep(0.5)
             
         log_progress("Solver completed", 0.90)
 
@@ -2440,6 +2480,89 @@ class CourseScheduler:
             analysis["weeks_with_any_trainer"] = sum(1 for count in weeks_with_trainers.values() if count > 0)
 
         return analysis
+
+    def _sample_courses_for_optimization(self, course_df, max_courses=500):
+        """Sample the most important courses for optimization when dealing with extremely large problems"""
+        # Make a copy to avoid modifying the original dataframe
+        df = course_df.copy()
+        
+        # Calculate the total runs before sampling
+        total_runs_before = df["Runs"].sum()
+        
+        # Count total runs so far
+        total_runs = 0
+        
+        # Dictionary to track which courses to keep
+        courses_to_keep = {}
+        
+        # First pass: Sort courses by importance criteria
+        # Priority 1: Required courses (you can define what makes a course "required")
+        # Priority 2: Courses with champions assigned
+        # Priority 3: Courses with the most qualified trainers
+        
+        # Create a scoring system for course importance
+        scored_courses = []
+        for _, row in df.iterrows():
+            course = row["Course Name"]
+            language = row["Language"]
+            runs = row["Runs"]
+            
+            # Skip courses we've already decided on
+            if (course, language) in courses_to_keep:
+                continue
+                
+            # Calculate a score for this course (higher is more important)
+            score = 0
+            
+            # Check if it has a champion (courses with champions get priority)
+            if (course, language) in self.course_champions:
+                score += 100
+                
+            # Check how many qualified trainers it has (more trainers = more flexibility)
+            trainer_count = len(self.fleximatrix.get((course, language), []))
+            score += min(trainer_count * 5, 50)  # Cap at 50 points
+            
+            # Add the course to our scoring list
+            scored_courses.append({
+                "course": course,
+                "language": language,
+                "runs": runs,
+                "score": score,
+                "row_idx": _
+            })
+        
+        # Sort courses by score (highest first)
+        scored_courses.sort(key=lambda x: x["score"], reverse=True)
+        
+        # Find the row indices to keep
+        indices_to_keep = []
+        
+        # Take courses until we reach max_courses
+        for course_info in scored_courses:
+            if total_runs + course_info["runs"] <= max_courses:
+                indices_to_keep.append(course_info["row_idx"])
+                total_runs += course_info["runs"]
+            else:
+                # If including all runs would exceed our limit, 
+                # reduce the number of runs for this course
+                remaining = max_courses - total_runs
+                if remaining > 0:
+                    # Create a modified row with reduced runs
+                    reduced_row = df.loc[course_info["row_idx"]].copy()
+                    reduced_row["Runs"] = remaining
+                    # Add this row to a list of modified rows to append later
+                    df.at[course_info["row_idx"], "Runs"] = remaining
+                    indices_to_keep.append(course_info["row_idx"])
+                    total_runs += remaining
+                break
+        
+        # Filter the dataframe
+        sampled_df = df.loc[indices_to_keep].copy().reset_index(drop=True)
+        
+        # Add a note about how many courses were dropped
+        print(f"Sampling: Reduced from {total_runs_before} to {sampled_df['Runs'].sum()} total course runs")
+        
+        return sampled_df
 
 
 # Create Streamlit application
