@@ -9,6 +9,9 @@ from openpyxl import Workbook
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.drawing.image import Image
+import threading
+import time
+import os
 
 # Set up logging at the beginning of your app.py
 logging.basicConfig(level=logging.ERROR)
@@ -278,15 +281,53 @@ class CourseScheduler:
         # Apply accelerated mode optimizations if enabled
         if accelerated_mode:
             log_progress("Running in accelerated mode - applying speed optimizations...", 0.01)
-            # Reduce affinity constraints 
-            max_affinity_constraints = max(10, max_affinity_constraints // 2)
-            # Simplify solution strategy for speed
-            if solution_strategy != "FIND_FEASIBLE_FAST":
+            
+            # Check model size to determine level of acceleration needed
+            total_courses = sum(self.course_run_data["Runs"])
+            
+            if total_courses > 500:
+                log_progress(f"Extremely large problem detected ({total_courses} courses) - applying maximum optimizations", 0.02)
+                # Maximum optimizations for extremely large problems
+                max_affinity_constraints = 0  # Disable affinity constraints completely
                 solution_strategy = "FIND_FEASIBLE_FAST"
-            # Increase number of workers
-            num_workers = min(16, num_workers * 2)
-            # Simplify the monthly distribution objective
-            monthly_weight = monthly_weight // 2
+                num_workers = min(32, os.cpu_count() or 8)  # Use all available CPU cores if possible
+                monthly_weight = 1  # Minimal monthly distribution weight
+                champion_weight = 1  # Minimal champion weight
+                utilization_weight = 1  # Minimal utilization weight
+                min_course_spacing = 1  # Minimum possible spacing
+                # Drastically shorten time limit
+                solver_time_minutes = min(solver_time_minutes, 5)
+                
+                # Apply sampling for extremely large problems - only optimize a subset of courses
+                if total_courses > 700:
+                    log_progress("Applying course sampling for enormous problem - will optimize in batches", 0.03)
+                    # We'll need to sample courses by sorting by priority and taking most important ones
+                    self.course_run_data = self._sample_courses_for_optimization(self.course_run_data, max_courses=500)
+                    log_progress(f"Reduced to {sum(self.course_run_data['Runs'])} highest priority courses", 0.04)
+                
+                log_progress("Maximum optimizations applied - sacrificing constraint quality for speed", 0.05)
+            elif total_courses > 300:
+                log_progress(f"Large problem detected ({total_courses} courses) - applying aggressive optimizations", 0.02)
+                # Very aggressive settings for large problems
+                max_affinity_constraints = max(3, max_affinity_constraints // 8)
+                solution_strategy = "FIND_FEASIBLE_FAST"
+                num_workers = min(16, num_workers * 2)
+                monthly_weight = monthly_weight // 4
+                champion_weight = champion_weight // 4
+                utilization_weight = utilization_weight // 4
+                min_course_spacing = 1  # Minimum possible spacing
+                # Shorten time limit to avoid excessive solving
+                solver_time_minutes = min(solver_time_minutes, 10)
+                log_progress("Aggressive optimizations applied for large problem", 0.03)
+            else:
+                # Standard optimizations for smaller problems
+                max_affinity_constraints = max(5, max_affinity_constraints // 4)
+                solution_strategy = "FIND_FEASIBLE_FAST"
+                num_workers = min(16, num_workers * 2)
+                monthly_weight = monthly_weight // 2
+                champion_weight = champion_weight // 2
+                utilization_weight = utilization_weight // 2
+                min_course_spacing = max(1, min_course_spacing - 1)
 
         # Get total F2F runs
         log_progress("Starting optimization process...", 0.01)
@@ -886,20 +927,21 @@ class CourseScheduler:
                 self._solution_count = 0
                 
             def on_solution_callback(self):
-                self._solution_count += 1
-                current_time = datetime.datetime.now()
-                if not self._first_solution_time:
-                    self._first_solution_time = current_time
-                    log_progress(f"First solution found in {(current_time - self._start_time).total_seconds():.1f} seconds", 0.75)
-                
-                # Stop after time limit
-                elapsed_seconds = (current_time - self._start_time).total_seconds()
-                if elapsed_seconds >= self._time_limit * 0.95:  # Stop at 95% of time limit to ensure we return on time
-                    log_progress(f"Time limit approaching, stopping search after {self._solution_count} solutions", 0.85)
-                    self._stop_search = True
+                try:
+                    self._solution_count += 1
+                    current_time = datetime.datetime.now()
+                    elapsed_seconds = (current_time - self._start_time).total_seconds()
                     
-            def stop_search(self):
-                return self._stop_search
+                    if self._solution_count == 1:
+                        log_progress(f"First solution found in {elapsed_seconds:.1f} seconds", 0.75)
+                    elif self._solution_count % 10 == 0:  # Log every 10 solutions
+                        log_progress(f"Found {self._solution_count} solutions in {elapsed_seconds:.1f} seconds", 0.80)
+                except Exception as e:
+                    # Catch any errors in the callback to prevent crashes
+                    pass
+                
+            def solution_count(self):
+                return self._solution_count
         
         log_progress(f"Configuring solver with {solver_time_minutes} minute time limit...", 0.60)
         
@@ -915,7 +957,59 @@ class CourseScheduler:
 
         # Solve the model
         log_progress("Starting solver...", 0.65)
-        status = solver.Solve(model, timeout_callback)
+        
+        # Create a separate thread to update status periodically
+        def status_updater():
+            start_time = datetime.datetime.now()
+            update_interval = 10  # seconds
+            while not solver_done:
+                # Sleep for a bit
+                time.sleep(update_interval)
+                
+                # Calculate elapsed time
+                elapsed_time = (datetime.datetime.now() - start_time).total_seconds()
+                minutes = int(elapsed_time // 60)
+                seconds = int(elapsed_time % 60)
+                
+                # Update status
+                log_progress(f"Optimizer still running ({minutes}m {seconds}s elapsed, max {solver_time_minutes}m)...", 
+                           0.70 + min(0.15, elapsed_time / (solver_time_minutes * 60) * 0.15))
+                
+                # Check if we're approaching the time limit
+                if elapsed_time >= solver_time_minutes * 60 * 0.9:  # 90% of time limit
+                    log_progress("Approaching time limit, preparing to return best solution found", 0.85)
+                
+                # Adjust update interval as time progresses
+                update_interval = min(30, update_interval + 5)  # gradually increase interval up to 30 seconds
+        
+        # Flag to signal when solver is done
+        solver_done = False
+        
+        # Start the status update thread
+        status_thread = threading.Thread(target=status_updater)
+        status_thread.daemon = True  # Thread will exit when main thread exits
+        status_thread.start()
+        
+        try:
+            # For extremely large problems, try a simpler approach first
+            if accelerated_mode and sum(self.course_run_data["Runs"]) > 500:
+                log_progress("Using simplified solver approach for extremely large problem", 0.70)
+                # Don't use callback for very large problems - it can cause crashes
+                status = solver.Solve(model)
+            else:
+                # Use callback for normal-sized problems
+                status = solver.Solve(model, solution_counter)
+        except Exception as e:
+            log_progress(f"Error during solving: {str(e)}", 0.85)
+            # Try again without the callback as a fallback
+            log_progress("Retrying without custom callback...", 0.86)
+            status = solver.Solve(model)
+        finally:
+            # Signal the status thread to stop
+            solver_done = True
+            # Wait for the thread to actually stop
+            time.sleep(0.5)
+            
         log_progress("Solver completed", 0.90)
 
         # Print status information
