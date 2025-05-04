@@ -434,10 +434,10 @@ class CourseScheduler:
         week_start = self.weekly_calendar[week_num - 1]
         week_end = week_start + datetime.timedelta(days=4)  # Assuming 5-day courses
 
-        # Check against all leave periods
         for _, leave in self.annual_leaves[self.annual_leaves["Name"] == trainer_name].iterrows():
             # If leave period overlaps with course week, trainer is unavailable
             if (leave["Start_Date"] <= week_end and leave["End_Date"] >= week_start):
+                print(f"DEBUG: {trainer_name} unavailable for week {week_start} to {week_end} due to leave {leave['Start_Date']} to {leave['End_Date']}")
                 return False
         return True
 
