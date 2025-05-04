@@ -411,7 +411,7 @@ class CourseScheduler:
         else:
             raise ValueError(f"Unknown optimization mode: {mode}")
 
-    def run_optimization(self, monthly_weight=5, priority_weight=4,
+    def run_optimization(self, monthly_weight=5,
                          affinity_weight=2, solver_time_minutes=5,
                          num_workers=8, min_course_spacing=2,
                          solution_strategy="BALANCED",
@@ -443,8 +443,6 @@ class CourseScheduler:
                 solution_strategy = "FIND_FEASIBLE_FAST"
                 num_workers = min(32, os.cpu_count() or 8)  # Use all available CPU cores if possible
                 monthly_weight = max(1, monthly_weight // 2)  # Reduce weights but maintain relative importance
-                priority_weight = max(1, priority_weight // 2)
-                utilization_weight = max(1, utilization_weight // 2)
                 min_course_spacing = max(1, min_course_spacing - 1)  # Reduce spacing but keep at least 1
                 # Drastically shorten time limit
                 solver_time_minutes = min(solver_time_minutes, 5)
@@ -453,24 +451,18 @@ class CourseScheduler:
             elif total_courses > 300:
                 log_progress(f"Large problem detected ({total_courses} courses) - applying aggressive optimizations", 0.02)
                 # Very aggressive settings for large problems
-                max_affinity_constraints = max(3, max_affinity_constraints // 8)
                 solution_strategy = "FIND_FEASIBLE_FAST"
                 num_workers = min(16, num_workers * 2)
                 monthly_weight = monthly_weight // 4
-                priority_weight = priority_weight // 4
-                utilization_weight = utilization_weight // 4
                 min_course_spacing = 1  # Minimum possible spacing
                 # Shorten time limit to avoid excessive solving
                 solver_time_minutes = min(solver_time_minutes, 10)
                 log_progress("Aggressive optimizations applied for large problem", 0.03)
             else:
                 # Standard optimizations for smaller problems
-                max_affinity_constraints = max(5, max_affinity_constraints // 4)
                 solution_strategy = "FIND_FEASIBLE_FAST"
                 num_workers = min(16, num_workers * 2)
                 monthly_weight = monthly_weight // 2
-                priority_weight = priority_weight // 2
-                utilization_weight = utilization_weight // 2
                 min_course_spacing = max(1, min_course_spacing - 1)
 
         # Get total F2F runs
@@ -902,9 +894,13 @@ class CourseScheduler:
             model.Add(var2 < var1 + gap_weeks).OnlyEnforceIf([too_close, either_in_last_term.Not()])
             model.Add(var2 > var1 - gap_weeks).OnlyEnforceIf([too_close, either_in_last_term.Not()])
 
-            # Add penalty for being too close
-            for _ in range(affinity_weight):
-                affinity_penalties.append(too_close)
+            # Create a penalty variable for this affinity pair
+            penalty = model.NewIntVar(0, 1, f"affinity_penalty_{c1}_{c2}_{run1}_{run2}")
+            model.Add(penalty == 1).OnlyEnforceIf(too_close)
+            model.Add(penalty == 0).OnlyEnforceIf(too_close.Not())
+            
+            # Add penalty to the list
+            affinity_penalties.append(penalty)
 
             print(f"  Added affinity constraint: {c1} and {c2} should be {gap_weeks} weeks apart (reduced to {reduced_gap} in last term Sep-Dec)")
             
@@ -941,7 +937,7 @@ class CourseScheduler:
                         model.Add(trainer_var != t_idx).OnlyEnforceIf(is_this_trainer.Not())
 
                         # Cannot have both is_this_week and is_this_trainer be true
-                        model.AddBoolOr([is_this_week.Not(), is_this_trainer.Not()])
+                        model.Add(is_this_week + is_this_trainer <= 1)
 
         # If prioritize_all_courses is true, add that message
         if prioritize_all_courses:
@@ -967,7 +963,11 @@ class CourseScheduler:
                 # Add priority based on trainer's title
                 title = self.consultant_data.loc[self.consultant_data["Name"] == trainer, "Title"].iloc[0]
                 priority = self.priority_data.loc[self.priority_data["Title"] == title, "Priority"].iloc[0]
-                priority_penalties.extend([is_assigned] * priority)
+                # Create a weighted penalty variable for this assignment
+                priority_penalty = model.NewIntVar(0, priority, f"priority_penalty_{course}_{i}_{trainer}")
+                model.Add(priority_penalty == priority).OnlyEnforceIf(is_assigned)
+                model.Add(priority_penalty == 0).OnlyEnforceIf(is_assigned.Not())
+                priority_penalties.append(priority_penalty)
 
         # Add constraints for maximum workload
         for trainer, workload_items in trainer_workload.items():
@@ -996,7 +996,10 @@ class CourseScheduler:
                 over_max = model.NewIntVar(0, max_days, f"{trainer}_days_over_max")
                 model.Add(over_max == total_workload - max_days).OnlyEnforceIf(total_workload > max_days)
                 model.Add(over_max == 0).OnlyEnforceIf(total_workload <= max_days)
-                workload_violation_penalties.extend([over_max] * 30)  # Weight of 30 for each day over max
+                # Create weighted penalty variable
+                over_max_penalty = model.NewIntVar(0, max_days * 30, f"{trainer}_over_max_penalty")
+                model.Add(over_max_penalty == over_max * 30)  # Weight of 30 for each day over max
+                workload_violation_penalties.append(over_max_penalty)
 
                 # Handle under min days violation with higher proportional penalty
                 min_days = self.consultant_data.loc[self.consultant_data["Name"] == trainer, "Min_Days"].iloc[0]
@@ -1004,7 +1007,10 @@ class CourseScheduler:
                     under_min = model.NewIntVar(0, min_days, f"{trainer}_days_under_min")
                     model.Add(under_min == min_days - total_workload).OnlyEnforceIf(total_workload < min_days)
                     model.Add(under_min == 0).OnlyEnforceIf(total_workload >= min_days)
-                    workload_violation_penalties.extend([under_min] * 50)  # Weight of 50 for each day under min
+                    # Create weighted penalty variable
+                    under_min_penalty = model.NewIntVar(0, min_days * 50, f"{trainer}_under_min_penalty")
+                    model.Add(under_min_penalty == under_min * 50)  # Weight of 50 for each day under min
+                    workload_violation_penalties.append(under_min_penalty)
 
         # NEW CODE: Add constraint to prevent trainers from teaching multiple courses in same week
         # Add this right after the trainer workload constraints
@@ -1129,7 +1135,6 @@ class CourseScheduler:
             # and adjust other weights to allow more flexibility
             unscheduled_weight = 20  # Very high weight to make this the top priority
             monthly_weight = monthly_weight // 2 if enforce_monthly_distribution else monthly_weight
-            priority_weight = priority_weight // 2
             min_course_spacing = max(1, min_course_spacing - 1)  # Reduce spacing requirements
 
             # Combined objective function with course scheduling priority
@@ -1139,7 +1144,6 @@ class CourseScheduler:
                 20 * sum(spacing_violation_penalties) +    # Third priority
                 monthly_weight * sum(month_deviation_penalties) +
                 affinity_weight * sum(affinity_penalties) +
-                priority_weight * sum(trainer_utilization_penalties) +
                 unscheduled_weight * sum(priority_penalties)
             )
         else:
@@ -1147,7 +1151,7 @@ class CourseScheduler:
             model.Minimize(
                 monthly_weight * sum(month_deviation_penalties) +
                 affinity_weight * sum(affinity_penalties) +
-                priority_weight * sum(trainer_utilization_penalties)
+                priority_weight * sum(priority_penalties)
             )
 
         # Initialize solver with customized parameters
@@ -1663,8 +1667,21 @@ class CourseScheduler:
             model.Add(var2 < var1 + gap_weeks).OnlyEnforceIf([too_close, either_in_last_term.Not()])
             model.Add(var2 > var1 - gap_weeks).OnlyEnforceIf([too_close, either_in_last_term.Not()])
 
-            affinity_penalties.append(too_close)
+            # Create a penalty variable for this affinity pair
+            penalty = model.NewIntVar(0, 1, f"affinity_penalty_{c1}_{c2}_{run1}_{run2}")
+            model.Add(penalty == 1).OnlyEnforceIf(too_close)
+            model.Add(penalty == 0).OnlyEnforceIf(too_close.Not())
+            
+            # Add penalty to the list
+            affinity_penalties.append(penalty)
+
             print(f"  Added affinity constraint: {c1} and {c2} should be {gap_weeks} weeks apart (reduced to {reduced_gap} in last term Sep-Dec)")
+            
+            # Log each affinity constraint with shortened course names for readability
+            c1_short = c1[:40] + "..." if len(c1) > 40 else c1
+            c2_short = c2[:40] + "..." if len(c2) > 40 else c2
+            log_message = f"Added affinity constraint: {c1_short} and {c2_short} should be {gap_weeks} weeks apart (reduced to {reduced_gap} in last term Sep-Dec)"
+            log_progress(log_message)
 
         # Add trainer utilization (soft)
         trainer_workload = {name: [] for name in self.consultant_data["Name"]}
@@ -1686,7 +1703,11 @@ class CourseScheduler:
                 # Add priority based on trainer's title
                 title = self.consultant_data.loc[self.consultant_data["Name"] == trainer, "Title"].iloc[0]
                 priority = self.priority_data.loc[self.priority_data["Title"] == title, "Priority"].iloc[0]
-                priority_penalties.extend([is_assigned] * priority)
+                # Create a weighted penalty variable for this assignment
+                priority_penalty = model.NewIntVar(0, priority, f"priority_penalty_{course}_{i}_{trainer}")
+                model.Add(priority_penalty == priority).OnlyEnforceIf(is_assigned)
+                model.Add(priority_penalty == 0).OnlyEnforceIf(is_assigned.Not())
+                priority_penalties.append(priority_penalty)
 
         # Calculate and constrain workload
         for trainer, workload_items in trainer_workload.items():
@@ -2966,12 +2987,6 @@ def main():
                     st.markdown('<div class="slider-header">Priority Weights</div>', unsafe_allow_html=True)
                     monthly_weight = st.slider("Monthly Distribution Priority", 1, 10, 5,
                                                help="Higher values enforce monthly targets more strictly")
-                    priority_weight = st.slider("Title-based Priority", 1, 10, 4,
-                                                help="Higher values prioritize assignments based on trainer titles")
-                    priority_weight = st.slider("Priority Weight", 1, 10, 4,
-                                                help="Higher values prioritize courses based on priority")
-                    utilization_weight = st.slider("Trainer Utilization Priority", 1, 10, 3,
-                                                   help="Higher values encourage higher trainer utilization")
                     affinity_weight = st.slider("Course Affinity Priority", 1, 10, 2,
                                                 help="Higher values enforce gaps between related courses")
                     st.markdown('</div>', unsafe_allow_html=True)
@@ -2986,17 +3001,8 @@ def main():
                         value=2,
                         help="Lower values allow courses to be scheduled closer together"
                     )
-                    utilization_target = st.slider(
-                        "Target Utilization Percentage",
-                        min_value=50,
-                        max_value=100,
-                        value=70,
-                        help="Target percentage of max workdays for trainers"
-                    )
-                    # Remove the max_affinity_constraints slider since we're using all affinity pairs
                     st.markdown('</div>', unsafe_allow_html=True)
 
-                with col2:
                     # Checkboxes and other options
                     st.markdown('<div class="slider-container">', unsafe_allow_html=True)
                     st.markdown('<div class="slider-header">Optimization Strategy</div>', unsafe_allow_html=True)
@@ -3087,7 +3093,6 @@ def main():
                             with st.spinner(f"Running optimization (maximum time: {solver_time} minutes)..."):
                                 status, schedule_df, solver, schedule, trainer_assignments, unscheduled_courses = st.session_state.scheduler.run_optimization(
                                     monthly_weight=monthly_weight,
-                                    priority_weight=priority_weight,
                                     affinity_weight=affinity_weight,
                                     solver_time_minutes=solver_time,
                                     num_workers=num_workers,
