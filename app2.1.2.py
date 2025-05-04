@@ -582,14 +582,11 @@ class CourseScheduler:
                                 valid_weeks.append(w)
                                 break
 
+                # HARD CONSTRAINT: Only allow start_week to be in valid_weeks
                 if valid_weeks:
-                    # Convert hard constraint to soft constraint
-                    for w in range(1, max_weeks + 1):
-                        if w not in valid_weeks:
-                            is_invalid_week = model.NewBoolVar(f"{course}_{i}_invalid_week_{w}")
-                            model.Add(start_week == w).OnlyEnforceIf(is_invalid_week)
-                            model.Add(start_week != w).OnlyEnforceIf(is_invalid_week.Not())
-                            unscheduled_course_penalties.append(is_invalid_week)
+                    model.AddAllowedAssignments([start_week], [[w] for w in valid_weeks] + [[0]])  # 0 means unscheduled
+                else:
+                    model.Add(start_week == 0)
 
         # Add special handling for high-volume courses
         if self.high_volume_courses:  # Use local variable instead of self.high_volume_courses
