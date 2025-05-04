@@ -499,6 +499,7 @@ class CourseScheduler:
         model = cp_model.CpModel()
         schedule = {}
         trainer_assignments = {}
+        champion_assignments = {}  # Track champion assignments for hard constraints
         max_weeks = len(self.weekly_calendar)
 
         log_progress("Creating variables for courses and trainers...", 0.15)
@@ -506,11 +507,9 @@ class CourseScheduler:
         # All penalty lists
         month_deviation_penalties = []
         affinity_penalties = []
-        trainer_utilization_penalties = []
         unscheduled_course_penalties = []  # For unscheduled courses
         workload_violation_penalties = []  # For workload violations
         spacing_violation_penalties = []   # For course spacing violations
-        priority_penalties = []  # For priority-based penalties
 
         # Create the schedule variables for each course and run
         for _, row in self.course_run_data.iterrows():
@@ -937,7 +936,7 @@ class CourseScheduler:
                         model.Add(trainer_var != t_idx).OnlyEnforceIf(is_this_trainer.Not())
 
                         # Cannot have both is_this_week and is_this_trainer be true
-                        model.Add(is_this_week + is_this_trainer <= 1)
+                        model.AddBoolOr([is_this_week.Not(), is_this_trainer.Not()])
 
         # If prioritize_all_courses is true, add that message
         if prioritize_all_courses:
@@ -960,14 +959,11 @@ class CourseScheduler:
                 # Accumulate workload
                 trainer_workload[trainer].append((is_assigned, duration))
 
-                # Add priority based on trainer's title
-                title = self.consultant_data.loc[self.consultant_data["Name"] == trainer, "Title"].iloc[0]
-                priority = self.priority_data.loc[self.priority_data["Title"] == title, "Priority"].iloc[0]
-                # Create a weighted penalty variable for this assignment
-                priority_penalty = model.NewIntVar(0, priority, f"priority_penalty_{course}_{i}_{trainer}")
-                model.Add(priority_penalty == priority).OnlyEnforceIf(is_assigned)
-                model.Add(priority_penalty == 0).OnlyEnforceIf(is_assigned.Not())
-                priority_penalties.append(priority_penalty)
+                # If this trainer is the champion for this course, track the assignment
+                if trainer == course_champion:
+                    if (course, language, trainer) not in champion_assignments:
+                        champion_assignments[(course, language, trainer)] = []
+                    champion_assignments[(course, language, trainer)].append(is_assigned)
 
         # Add constraints for maximum workload
         for trainer, workload_items in trainer_workload.items():
@@ -994,8 +990,11 @@ class CourseScheduler:
                 
                 # Handle over max days violation with proportional penalty
                 over_max = model.NewIntVar(0, max_days, f"{trainer}_days_over_max")
-                model.Add(over_max == total_workload - max_days).OnlyEnforceIf(total_workload > max_days)
-                model.Add(over_max == 0).OnlyEnforceIf(total_workload <= max_days)
+                is_over_max = model.NewBoolVar(f"{trainer}_is_over_max")
+                model.Add(total_workload > max_days).OnlyEnforceIf(is_over_max)
+                model.Add(total_workload <= max_days).OnlyEnforceIf(is_over_max.Not())
+                model.Add(over_max == total_workload - max_days).OnlyEnforceIf(is_over_max)
+                model.Add(over_max == 0).OnlyEnforceIf(is_over_max.Not())
                 # Create weighted penalty variable
                 over_max_penalty = model.NewIntVar(0, max_days * 30, f"{trainer}_over_max_penalty")
                 model.Add(over_max_penalty == over_max * 30)  # Weight of 30 for each day over max
@@ -1005,12 +1004,23 @@ class CourseScheduler:
                 min_days = self.consultant_data.loc[self.consultant_data["Name"] == trainer, "Min_Days"].iloc[0]
                 if min_days > 0:  # Only add minimum constraint if min_days is set
                     under_min = model.NewIntVar(0, min_days, f"{trainer}_days_under_min")
-                    model.Add(under_min == min_days - total_workload).OnlyEnforceIf(total_workload < min_days)
-                    model.Add(under_min == 0).OnlyEnforceIf(total_workload >= min_days)
+                    is_under_min = model.NewBoolVar(f"{trainer}_is_under_min")
+                    model.Add(total_workload < min_days).OnlyEnforceIf(is_under_min)
+                    model.Add(total_workload >= min_days).OnlyEnforceIf(is_under_min.Not())
+                    model.Add(under_min == min_days - total_workload).OnlyEnforceIf(is_under_min)
+                    model.Add(under_min == 0).OnlyEnforceIf(is_under_min.Not())
                     # Create weighted penalty variable
                     under_min_penalty = model.NewIntVar(0, min_days * 50, f"{trainer}_under_min_penalty")
                     model.Add(under_min_penalty == under_min * 50)  # Weight of 50 for each day under min
                     workload_violation_penalties.append(under_min_penalty)
+
+        # Add hard constraint: Champions must teach at least one instance of their course
+        print("Adding champion teaching requirements...")
+        for (course, language, champion), assignments in champion_assignments.items():
+            if assignments:  # Only if there are instances of this course
+                # Champion must teach at least one instance of their course
+                model.Add(sum(assignments) >= 1)
+                print(f"Added constraint: Champion {champion} must teach at least one instance of {course} ({language})")
 
         # NEW CODE: Add constraint to prevent trainers from teaching multiple courses in same week
         # Add this right after the trainer workload constraints
@@ -1151,7 +1161,8 @@ class CourseScheduler:
             model.Minimize(
                 monthly_weight * sum(month_deviation_penalties) +
                 affinity_weight * sum(affinity_penalties) +
-                priority_weight * sum(priority_penalties)
+                30 * sum(workload_violation_penalties) +   # High weight for workload violations
+                20 * sum(spacing_violation_penalties)      # Medium weight for spacing violations
             )
 
         # Initialize solver with customized parameters
@@ -1577,7 +1588,7 @@ class CourseScheduler:
         workload_violation_penalties = []
         spacing_violation_penalties = []
         month_deviation_penalties = []
-        priority_penalties = []  # For priority-based penalties
+       
 
         # Add affinity constraints (soft)
         for _, row in self.affinity_matrix_data.iterrows():
@@ -1700,14 +1711,12 @@ class CourseScheduler:
                 # Accumulate workload
                 trainer_workload[trainer].append((is_assigned, duration))
 
-                # Add priority based on trainer's title
-                title = self.consultant_data.loc[self.consultant_data["Name"] == trainer, "Title"].iloc[0]
-                priority = self.priority_data.loc[self.priority_data["Title"] == title, "Priority"].iloc[0]
-                # Create a weighted penalty variable for this assignment
-                priority_penalty = model.NewIntVar(0, priority, f"priority_penalty_{course}_{i}_{trainer}")
-                model.Add(priority_penalty == priority).OnlyEnforceIf(is_assigned)
-                model.Add(priority_penalty == 0).OnlyEnforceIf(is_assigned.Not())
-                priority_penalties.append(priority_penalty)
+                # Add champion priority (only if this trainer is the champion for this course)
+                if trainer == course_champion:
+                    champion_penalty = model.NewBoolVar(f"{course}_{i}_champion_penalty_{trainer}")
+                    model.Add(champion_penalty == 1).OnlyEnforceIf(is_assigned)
+                    model.Add(champion_penalty == 0).OnlyEnforceIf(is_assigned.Not())
+                    priority_penalties.append(champion_penalty)
 
         # Calculate and constrain workload
         for trainer, workload_items in trainer_workload.items():
@@ -1753,7 +1762,6 @@ class CourseScheduler:
             "workload": workload_violation_penalties,
             "spacing": spacing_violation_penalties,
             "monthly": month_deviation_penalties,
-            "priority": priority_penalties
         }
 
         # Create weights dictionary from parameters
@@ -2209,176 +2217,157 @@ class CourseScheduler:
         from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
         from openpyxl.utils import get_column_letter
         from openpyxl.drawing.image import Image
+        import datetime
         
         output = io.BytesIO()
 
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            # Write existing sheets
             if schedule_df is not None:
                 schedule_df.to_excel(writer, sheet_name='Schedule', index=False)
             else:
-                # Create an empty DataFrame if None
                 pd.DataFrame(columns=["No data available"]).to_excel(writer, sheet_name='Schedule', index=False)
 
             if monthly_validation_df is not None:
                 monthly_validation_df.to_excel(writer, sheet_name='Monthly Validation', index=False)
             else:
-                pd.DataFrame(columns=["No data available"]).to_excel(writer, sheet_name='Monthly Validation',
-                                                                     index=False)
+                pd.DataFrame(columns=["No data available"]).to_excel(writer, sheet_name='Monthly Validation', index=False)
 
             if trainer_utilization_df is not None:
                 trainer_utilization_df.to_excel(writer, sheet_name='Trainer Utilization', index=False)
             else:
-                pd.DataFrame(columns=["No data available"]).to_excel(writer, sheet_name='Trainer Utilization',
-                                                                     index=False)
-            
-            # Create the new Calendar View sheet
-            if schedule_df is not None and not schedule_df.empty:
-                # Get all trainers from the consultant data
-                trainers = self.consultant_data["Name"].tolist()
-                
-                # Create a new dataframe with trainers as rows
-                calendar_data = []
-                for trainer in trainers:
-                    calendar_data.append({"Trainer": trainer})
-                
-                calendar_df = pd.DataFrame(calendar_data)
-                
-                # Add the dataframe to the Excel but we'll manually format it later
-                calendar_df.to_excel(writer, sheet_name='Calendar View', index=False)
-                
-                # Get the worksheet and workbook objects
-                worksheet = writer.sheets['Calendar View']
-                workbook = writer.book
-                
-                # Define fill colors
-                light_green_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")  # Assigned
-                dark_green_fill = PatternFill(start_color="006100", end_color="006100", fill_type="solid")   # Champion
-                red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")         # Vacation
-                purple_fill = PatternFill(start_color="CCC0DA", end_color="CCC0DA", fill_type="solid")      # Holiday
-                
-                # Create header row with week start dates
-                for col_idx, week_start_date in enumerate(self.weekly_calendar, start=2):
-                    # Format date as DD-MMM
-                    formatted_date = week_start_date.strftime("%d-%b")
-                    week_num = col_idx - 1  # Adjusted for Excel column indexing
-                    
-                    # Write the date to the header
-                    cell = worksheet.cell(row=1, column=col_idx)
-                    cell.value = formatted_date
-                    cell.alignment = Alignment(horizontal='center', vertical='center')
-                    cell.font = Font(bold=True)
-                    
-                    # Format column width
-                    worksheet.column_dimensions[get_column_letter(col_idx)].width = 10
-                
-                # Create dictionary to track trainer assignments by week
-                trainer_assignments_by_week = {}
-                champion_assignments_by_week = {}
-                course_assignments_by_week = {}  # New dictionary to track course names and languages
-                
-                # Process schedule data to get assignments
+                pd.DataFrame(columns=["No data available"]).to_excel(writer, sheet_name='Trainer Utilization', index=False)
+
+            # Add new sheet: Optimization Parameters
+            params_data = {
+                'Parameter': [
+                    'Run Date and Time',
+                    'Monthly Distribution Weight',
+                    'Affinity Weight',
+                    'Workload Violation Weight',
+                    'Spacing Violation Weight',
+                    'Minimum Course Spacing',
+                    'Solution Strategy',
+                    'Enforce Monthly Distribution',
+                    'Prioritize All Courses',
+                    'Number of Workers',
+                    'Total Courses',
+                    'Total Course Runs',
+                    'Total Trainers',
+                    'Total Champions'
+                ],
+                'Value': [
+                    datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    '30',  # These are the weights from the objective function
+                    '20',
+                    '30',
+                    '20',
+                    '2',  # Default min_course_spacing
+                    'BALANCED',
+                    'False',
+                    'False',
+                    '8',
+                    len(set(self.course_run_data['Course Name'])),
+                    sum(self.course_run_data['Runs']),
+                    len(self.consultant_data),
+                    len(self.course_champions)
+                ]
+            }
+            params_df = pd.DataFrame(params_data)
+            params_df.to_excel(writer, sheet_name='Optimization Parameters', index=False)
+
+            # Add new sheet: Affinity Violations
+            if schedule_df is not None:
+                violations = []
+                # Create a dictionary for quick lookup of course schedules
+                course_schedules = {}
                 for _, row in schedule_df.iterrows():
+                    course = row['Course']
                     week = row['Week']
-                    trainer = row['Trainer']
-                    course = row['Course']  # Get course name
-                    language = row['Language']  # Get language
-                    is_champion = row['Champion'].strip() == "✓"
+                    language = row['Language']
+                    course_schedules[(course, language)] = course_schedules.get((course, language), []) + [week]
+
+                # Check each affinity pair
+                for _, row in self.affinity_matrix_data.iterrows():
+                    c1, c2, gap_weeks = row['Course 1'], row['Course 2'], row['Gap Weeks']
                     
-                    # Add language suffix
-                    course_with_lang = f"{course} ({language[0]})"  # Use first letter of language (E/A)
-                    
-                    if (trainer, week) not in trainer_assignments_by_week:
-                        trainer_assignments_by_week[(trainer, week)] = 0
-                        course_assignments_by_week[(trainer, week)] = course_with_lang  # Store course name with language
-                    
-                    trainer_assignments_by_week[(trainer, week)] += 1
-                    
-                    if is_champion:
-                        if (trainer, week) not in champion_assignments_by_week:
-                            champion_assignments_by_week[(trainer, week)] = 0
-                        
-                        champion_assignments_by_week[(trainer, week)] += 1
+                    # Get all language combinations
+                    c1_languages = self.course_run_data[self.course_run_data['Course Name'] == c1]['Language'].unique()
+                    c2_languages = self.course_run_data[self.course_run_data['Course Name'] == c2]['Language'].unique()
+
+                    for lang1 in c1_languages:
+                        for lang2 in c2_languages:
+                            if (c1, lang1) in course_schedules and (c2, lang2) in course_schedules:
+                                weeks1 = course_schedules[(c1, lang1)]
+                                weeks2 = course_schedules[(c2, lang2)]
+
+                                for w1 in weeks1:
+                                    for w2 in weeks2:
+                                        actual_gap = abs(w1 - w2)
+                                        
+                                        # Check if either course is in last term (Sep-Dec)
+                                        w1_month = self.week_to_month_map.get(w1, 0)
+                                        w2_month = self.week_to_month_map.get(w2, 0)
+                                        is_last_term = w1_month >= 9 or w2_month >= 9
+                                        
+                                        required_gap = gap_weeks - 1 if is_last_term else gap_weeks
+                                        
+                                        if actual_gap < required_gap:
+                                            violations.append({
+                                                'Course 1': f"{c1} ({lang1})",
+                                                'Course 2': f"{c2} ({lang2})",
+                                                'Required Gap': required_gap,
+                                                'Actual Gap': actual_gap,
+                                                'Course 1 Week': w1,
+                                                'Course 2 Week': w2,
+                                                'Course 1 Date': self.weekly_calendar[w1-1].strftime("%Y-%m-%d"),
+                                                'Course 2 Date': self.weekly_calendar[w2-1].strftime("%Y-%m-%d"),
+                                                'In Last Term': 'Yes' if is_last_term else 'No',
+                                                'Gap Difference': required_gap - actual_gap
+                                            })
+
+                if violations:
+                    violations_df = pd.DataFrame(violations)
+                    # Sort by gap difference (biggest violations first)
+                    violations_df = violations_df.sort_values('Gap Difference', ascending=False)
+                    violations_df.to_excel(writer, sheet_name='Affinity Violations', index=False)
+                else:
+                    pd.DataFrame(columns=['No affinity violations found']).to_excel(writer, sheet_name='Affinity Violations', index=False)
+
+            # Format the sheets
+            workbook = writer.book
+            
+            # Format Optimization Parameters sheet
+            worksheet = workbook['Optimization Parameters']
+            for row in worksheet.iter_rows(min_row=1, max_row=worksheet.max_row):
+                for cell in row:
+                    cell.alignment = Alignment(horizontal='left', vertical='center')
+            worksheet.column_dimensions['A'].width = 30
+            worksheet.column_dimensions['B'].width = 50
+
+            # Format Affinity Violations sheet if it exists and has violations
+            if 'Affinity Violations' in workbook.sheetnames and violations:
+                worksheet = workbook['Affinity Violations']
+                header_fill = PatternFill(start_color="CCE5FF", end_color="CCE5FF", fill_type="solid")
+                violation_fill = PatternFill(start_color="FFE5E5", end_color="FFE5E5", fill_type="solid")
                 
-                # Increase column width for course names
-                for col_idx in range(2, len(self.weekly_calendar) + 2):
-                    worksheet.column_dimensions[get_column_letter(col_idx)].width = 20
-                
-                # Process all trainers and weeks
-                for row_idx, trainer in enumerate(trainers, start=2):
-                    for col_idx, week_start_date in enumerate(self.weekly_calendar, start=2):
-                        week_num = col_idx - 1  # Adjusted for Excel column indexing
-                        cell = worksheet.cell(row=row_idx, column=col_idx)
-                        cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
-                        
-                        # Check for public holidays
-                        has_public_holiday = False
-                        for _, holiday in self.public_holidays_data.iterrows():
-                            week_end_date = week_start_date + datetime.timedelta(days=4)  # 5-day work week
-                            if (holiday["Start Date"] <= week_end_date and holiday["End Date"] >= week_start_date):
-                                has_public_holiday = True
-                                break
-                        
-                        # Check for trainer vacation
-                        is_on_vacation = False
-                        for _, leave in self.annual_leaves[self.annual_leaves["Name"] == trainer].iterrows():
-                            week_end_date = week_start_date + datetime.timedelta(days=4)  # 5-day work week
-                            if (leave["Start_Date"] <= week_end_date and leave["End_Date"] >= week_start_date):
-                                is_on_vacation = True
-                                break
-                        
-                        # Check for trainer assignment
-                        is_assigned = (trainer, week_num) in trainer_assignments_by_week
-                        is_champion_assignment = (trainer, week_num) in champion_assignments_by_week
-                        
-                        # Apply appropriate fill and set value
-                        if is_on_vacation:
-                            cell.fill = red_fill
-                            cell.value = "Vacation"
-                        elif has_public_holiday:
-                            cell.fill = purple_fill
-                            cell.value = "Holiday"
-                        elif is_champion_assignment:
-                            cell.fill = dark_green_fill
-                            cell.value = course_assignments_by_week.get((trainer, week_num), "")
-                            cell.font = Font(color="FFFFFF")  # White text for dark background
-                        elif is_assigned:
-                            cell.fill = light_green_fill
-                            cell.value = course_assignments_by_week.get((trainer, week_num), "")
-                        else:
-                            cell.value = ""
-                
-                # Add a legend
-                legend_row = len(trainers) + 4
-                
-                worksheet.cell(row=legend_row, column=1).value = "Legend:"
-                worksheet.cell(row=legend_row, column=1).font = Font(bold=True)
-                
-                # Trainer assigned
-                worksheet.cell(row=legend_row + 1, column=1).value = "Light Green:"
-                worksheet.cell(row=legend_row + 1, column=2).value = "Trainer Assigned"
-                worksheet.cell(row=legend_row + 1, column=2).fill = light_green_fill
-                
-                # Champion assigned
-                worksheet.cell(row=legend_row + 2, column=1).value = "Dark Green:"
-                worksheet.cell(row=legend_row + 2, column=2).value = "Champion Assigned"
-                worksheet.cell(row=legend_row + 2, column=2).fill = dark_green_fill
-                worksheet.cell(row=legend_row + 2, column=2).font = Font(color="FFFFFF")
-                
-                # Vacation
-                worksheet.cell(row=legend_row + 3, column=1).value = "Red:"
-                worksheet.cell(row=legend_row + 3, column=2).value = "Trainer on Vacation"
-                worksheet.cell(row=legend_row + 3, column=2).fill = red_fill
-                
-                # Public holiday
-                worksheet.cell(row=legend_row + 4, column=1).value = "Purple:"
-                worksheet.cell(row=legend_row + 4, column=2).value = "Public Holiday"
-                worksheet.cell(row=legend_row + 4, column=2).fill = purple_fill
-                
-                # Adjust column width for trainer names
-                worksheet.column_dimensions['A'].width = 25
-            else:
-                # Create an empty calendar view if no schedule data
-                pd.DataFrame(columns=["No schedule data available"]).to_excel(writer, sheet_name='Calendar View', index=False)
+                # Format headers
+                for cell in worksheet[1]:
+                    cell.fill = header_fill
+                    cell.font = Font(bold=True)
+                    cell.alignment = Alignment(horizontal='center', vertical='center')
+
+                # Format data rows and adjust column widths
+                for col in worksheet.columns:
+                    max_length = 0
+                    col_letter = get_column_letter(col[0].column)
+                    for cell in col:
+                        try:
+                            if len(str(cell.value)) > max_length:
+                                max_length = len(str(cell.value))
+                        except:
+                            pass
+                    worksheet.column_dimensions[col_letter].width = min(max_length + 2, 50)
 
         output.seek(0)
         return output
