@@ -1042,7 +1042,21 @@ class CourseScheduler:
 
                 trainer_var = model.NewIntVar(0, len(qualified_trainers) - 1, f"trainer_{course}_{i}")
                 trainer_assignments[(course, delivery_type, language, i)] = trainer_var
-
+                    # ENFORCE: Trainer cannot be assigned if unavailable in that week
+            for (course, delivery_type, language, i), trainer_var in trainer_assignments.items():
+                qualified_trainers = self.fleximatrix.get((course, language), [])
+                for t_idx, trainer in enumerate(qualified_trainers):
+                    for week in range(1, max_weeks + 1):
+                        if not self.is_trainer_available(trainer, week):
+                            is_this_week = model.NewBoolVar(f"{course}_{i}_in_week_{week}")
+                            is_this_trainer = model.NewBoolVar(f"{course}_{i}_trainer_{t_idx}")
+                            model.Add(schedule[(course, delivery_type, language, i)] == week).OnlyEnforceIf(is_this_week)
+                            model.Add(schedule[(course, delivery_type, language, i)] != week).OnlyEnforceIf(is_this_week.Not())
+                            model.Add(trainer_var == t_idx).OnlyEnforceIf(is_this_trainer)
+                            model.Add(trainer_var != t_idx).OnlyEnforceIf(is_this_trainer.Not())
+                            # Cannot have both is_this_week and is_this_trainer be true
+                            model.AddBoolOr([is_this_week.Not(), is_this_trainer.Not()])
+                        
         # Check feasibility with just variables
         solver = cp_model.CpSolver()
         solver.parameters.max_time_in_seconds = 30  # Short timeout for each step
@@ -1103,7 +1117,7 @@ class CourseScheduler:
                 model.Add(week_var != week).OnlyEnforceIf(is_this_week.Not())
 
                 # For each trainer, check availability
-                for t_idx, trainer in enumerate(qualified_trainers):
+            for t_idx, trainer in enumerate(qualified_trainers):
                     if not self.is_trainer_available(trainer, week):
                         # If trainer is not available this week, cannot select this trainer
                         is_this_trainer = model.NewBoolVar(f"{course}_{i}_trainer_{t_idx}_week_{week}")
