@@ -337,28 +337,77 @@ class CourseScheduler:
         # Use provided weights or defaults
         active_weights = weights or default_weights[mode]
 
+        # Create weighted sums for each penalty type
+        objective_terms = []
+
         if mode == "regular":
-            return model.Minimize(
-                active_weights["workload"] * sum(penalties["workload"]) +
-                active_weights["affinity"] * sum(penalties["affinity"]) +
-                active_weights["priority"] * sum(penalties["priority"]) +
-                active_weights["monthly"] * sum(penalties["monthly"])
-            )
+            if "workload" in penalties and penalties["workload"]:
+                objective_terms.extend([active_weights["workload"]] * len(penalties["workload"]))
+            if "affinity" in penalties and penalties["affinity"]:
+                objective_terms.extend([active_weights["affinity"]] * len(penalties["affinity"]))
+            if "priority" in penalties and penalties["priority"]:
+                objective_terms.extend([active_weights["priority"]] * len(penalties["priority"]))
+            if "monthly" in penalties and penalties["monthly"]:
+                objective_terms.extend([active_weights["monthly"]] * len(penalties["monthly"]))
+
+            # Combine all penalties into a single list
+            all_penalties = []
+            all_penalties.extend(penalties.get("workload", []))
+            all_penalties.extend(penalties.get("affinity", []))
+            all_penalties.extend(penalties.get("priority", []))
+            all_penalties.extend(penalties.get("monthly", []))
+
+            if not all_penalties:
+                return model.Minimize(0)  # No penalties to minimize
+
+            return model.Minimize(sum(w * p for w, p in zip(objective_terms, all_penalties)))
+
         elif mode == "prioritize_all":
-            return model.Minimize(
-                active_weights["unscheduled"] * sum(penalties["unscheduled"]) +
-                active_weights["workload"] * sum(penalties["workload"]) +
-                active_weights["spacing"] * sum(penalties["spacing"]) +
-                active_weights["monthly"] * sum(penalties["monthly"]) +
-                active_weights["affinity"] * sum(penalties["affinity"]) +
-                active_weights["priority"] * sum(penalties["priority"])
-            )
+            if "unscheduled" in penalties and penalties["unscheduled"]:
+                objective_terms.extend([active_weights["unscheduled"]] * len(penalties["unscheduled"]))
+            if "workload" in penalties and penalties["workload"]:
+                objective_terms.extend([active_weights["workload"]] * len(penalties["workload"]))
+            if "spacing" in penalties and penalties["spacing"]:
+                objective_terms.extend([active_weights["spacing"]] * len(penalties["spacing"]))
+            if "monthly" in penalties and penalties["monthly"]:
+                objective_terms.extend([active_weights["monthly"]] * len(penalties["monthly"]))
+            if "affinity" in penalties and penalties["affinity"]:
+                objective_terms.extend([active_weights["affinity"]] * len(penalties["affinity"]))
+            if "priority" in penalties and penalties["priority"]:
+                objective_terms.extend([active_weights["priority"]] * len(penalties["priority"]))
+
+            # Combine all penalties into a single list
+            all_penalties = []
+            all_penalties.extend(penalties.get("unscheduled", []))
+            all_penalties.extend(penalties.get("workload", []))
+            all_penalties.extend(penalties.get("spacing", []))
+            all_penalties.extend(penalties.get("monthly", []))
+            all_penalties.extend(penalties.get("affinity", []))
+            all_penalties.extend(penalties.get("priority", []))
+
+            if not all_penalties:
+                return model.Minimize(0)  # No penalties to minimize
+
+            return model.Minimize(sum(w * p for w, p in zip(objective_terms, all_penalties)))
+
         elif mode == "incremental":
-            return model.Minimize(
-                40 * sum(penalties["workload"]) +
-                2 * sum(penalties["affinity"]) +
-                4 * sum(penalties["priority"])
-            )
+            if "workload" in penalties and penalties["workload"]:
+                objective_terms.extend([40] * len(penalties["workload"]))
+            if "affinity" in penalties and penalties["affinity"]:
+                objective_terms.extend([2] * len(penalties["affinity"]))
+            if "priority" in penalties and penalties["priority"]:
+                objective_terms.extend([4] * len(penalties["priority"]))
+
+            # Combine all penalties into a single list
+            all_penalties = []
+            all_penalties.extend(penalties.get("workload", []))
+            all_penalties.extend(penalties.get("affinity", []))
+            all_penalties.extend(penalties.get("priority", []))
+
+            if not all_penalties:
+                return model.Minimize(0)  # No penalties to minimize
+
+            return model.Minimize(sum(w * p for w, p in zip(objective_terms, all_penalties)))
         else:
             raise ValueError(f"Unknown optimization mode: {mode}")
 
