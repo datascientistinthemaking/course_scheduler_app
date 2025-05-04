@@ -1,0 +1,615 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Bottleneck Buster</title>
+    <link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/tone@14.7.77/build/Tone.min.js"></script>
+    <style>
+        body {
+            font-family: 'Press Start 2P', cursive;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            background-color: #f0f0f0;
+            margin: 0;
+            background-image: linear-gradient(to bottom, #68c1ff, #b4f5ff);
+            padding: 10px;
+        }
+
+        .container {
+            width: 95%;
+            max-width: 800px;
+            padding: 15px;
+            background-color: rgba(255, 255, 255, 0.9);
+            border-radius: 15px;
+            box-shadow: 0 8px 20px rgba(0, 0, 0, 0.2);
+            text-align: center;
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.3);
+        }
+
+        h1 {
+            font-size: 1.3rem;
+            margin-bottom: 0.8rem;
+            color: #1e3a8a;
+            text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.1);
+        }
+        @media (min-width: 640px) {
+            h1 {
+                font-size: 2.5rem;
+                margin-bottom: 1rem;
+            }
+        }
+
+        #gameCanvas {
+            background-color: #e0f2fe;
+            border-radius: 10px;
+            box-shadow: 3px 3px 7px rgba(0, 0, 0, 0.1);
+            margin-bottom: 1rem;
+            touch-action: manipulation;
+            width: 100%; /* Make canvas responsive */
+            height: auto;
+            max-height: 300px; /* Limit maximum height */
+        }
+
+        #controls {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr); /* 2 columns on mobile */
+            gap: 8px;
+            justify-content: center;
+            width: 100%;
+            margin: 0 auto;
+        }
+        
+        @media (min-width: 640px) {
+            #controls {
+                grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); /* Responsive grid layout on larger screens */
+                gap: 10px;
+            }
+        }
+
+        #controls button {
+            width: 100%;
+            padding: 8px 10px;
+            margin: 4px 0;
+            font-size: 0.7rem;
+            cursor: pointer;
+            border-radius: 10px;
+            background-color: #4CAF50;
+            color: white;
+            border: none;
+            transition: background-color 0.3s, transform 0.2s;
+            box-shadow: 2px 2px 5px rgba(0, 0, 0, 0.1);
+            text-align: center;
+            white-space: normal; /* Allow text to wrap */
+            height: auto;
+            min-height: 44px; /* Minimum touch target size */
+        }
+        
+        @media (min-width: 640px) {
+            #controls button {
+                padding: 12px 24px;
+                margin: 8px 0;
+                font-size: 1rem;
+            }
+        }
+
+        .button:hover {
+            background-color: #45a049;
+            transform: scale(1.05);
+        }
+
+        .button:active {
+            background-color: #388e3c;
+            transform: scale(0.95);
+            box-shadow: 1px 1px 2px rgba(0, 0, 0, 0.1);
+        }
+
+        #message {
+            font-size: 0.8rem;
+            color: #1a202c;
+            margin-bottom: 1rem;
+            min-height: 2em;
+            padding: 0.5em;
+            border-radius: 8px;
+            background-color: rgba(255, 255, 255, 0.8);
+            border: 1px solid rgba(255, 255, 255, 0.3);
+            box-shadow: 1px 1px 2px rgba(0, 0, 0, 0.1);
+        }
+        @media (min-width: 640px) {
+            #message {
+                font-size: 1.2rem;
+            }
+        }
+
+        #results {
+            text-align: center;
+            margin-top: 1rem;
+            border-top: 1px solid #e2e8f0;
+            padding-top: 1rem;
+        }
+
+        #results p {
+            font-size: 0.8rem;
+            color: #2d3748;
+        }
+        @media (min-width: 640px) {
+            #results p {
+                font-size: 1rem;
+            }
+        }
+
+        #processDisplay {
+            display: flex;
+            flex-wrap: wrap; /* Allow wrapping on very small screens */
+            justify-content: center;
+            margin-bottom: 1rem;
+            width: 100%;
+        }
+        
+        #processDisplay .step {
+            width: 45%; /* 2 per row on small screens */
+            padding: 8px;
+            border-radius: 8px;
+            background-color: #f7fafc;
+            border: 1px solid #edf2f7;
+            text-align: center;
+            font-size: 0.6rem;
+            color: #4a5568;
+            box-shadow: 1px 1px 2px rgba(0, 0, 0, 0.05);
+            position: relative;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            margin-bottom: 1rem;
+            margin-right: 2%;
+            margin-left: 2%;
+            min-height: 60px;
+        }
+        
+        @media (min-width: 480px) {
+            #processDisplay .step {
+                width: 22%; /* 4 per row on medium screens */
+                font-size: 0.7rem;
+                margin-right: 1%;
+                margin-left: 1%;
+            }
+        }
+        
+        @media (min-width: 640px) {
+            #processDisplay {
+                flex-wrap: nowrap;
+                flex-direction: row;
+                justify-content: space-around;
+            }
+            #processDisplay .step {
+                width: 22%;
+                margin-bottom: 0;
+                font-size: 0.8rem;
+            }
+        }
+
+        #processDisplay .step.bottleneck {
+            color: #4a5568;
+            font-weight: normal;
+        }
+
+        #throughputDisplay {
+            font-size: 0.8rem;
+            margin-top: 0.5rem;
+            color: #2d3748;
+        }
+        @media (min-width: 640px) {
+            #throughputDisplay {
+                font-size: 1rem;
+            }
+        }
+
+        .game-over-overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0, 0, 0, 0.8);
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            color: white;
+            font-size: 1.2rem;
+            z-index: 10;
+            border-radius: 15px;
+        }
+
+        .game-over-content {
+            background-color: rgba(255, 255, 255, 0.95);
+            padding: 15px;
+            border-radius: 10px;
+            text-align: center;
+            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.2);
+            color: #2d3748;
+            width: 90%;
+            max-width: 300px;
+        }
+
+        @media (min-width: 640px) {
+            .game-over-content {
+                padding: 20px;
+                max-width: 400px;
+            }
+        }
+
+        .game-over-title {
+            font-size: 1.2rem;
+            margin-bottom: 0.8rem;
+            color: #e53e3e;
+        }
+        
+        @media (min-width: 640px) {
+            .game-over-title {
+                font-size: 1.5rem;
+                margin-bottom: 1rem;
+            }
+        }
+
+        .game-over-message {
+            font-size: 1rem;
+            margin-bottom: 1.5rem;
+        }
+
+        .bottle-image-container {
+            position: absolute;
+            top: -30px; /* Adjusted for mobile */
+            left: 50%;
+            transform: translateX(-50%);
+            width: 40px; /* Smaller on mobile */
+            height: auto;
+        }
+
+        .bottle-image-container img {
+            width: 100%;
+            height: auto;
+            display: block;
+        }
+
+        #resetButton {
+            background-color: #e53e3e;
+        }
+
+        #resetButton:hover {
+            background-color: #c53030;
+        }
+
+        #resetButton:active {
+            background-color: #9b2c2c;
+        }
+
+        .event-log {
+            margin-top: 1rem;
+            padding: 1rem;
+            border: 1px solid #e2e8f0;
+            border-radius: 8px;
+            background-color: #f7fafc;
+            font-size: 0.8rem;
+            height: 100px;
+            overflow-y: auto;
+            color: #2d3748;
+            text-align: left;
+        }
+
+        .event-log-entry {
+            margin-bottom: 0.5rem;
+        }
+
+        .cost-display {
+            margin-top: 1rem;
+            font-size: 1rem;
+            color: #2d3748;
+        }
+        .warning {
+            color: #9b2c2c;
+            font-weight: bold;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Bottleneck Buster</h1>
+        <canvas id="gameCanvas"></canvas>
+        <div id="processDisplay">
+            <div class="step" id="step1">
+                <div class="bottle-image-container">
+                    <img src="https://placehold.co/50x50/EEE/31343C?text=B1&font=Roboto" alt="Bottle">
+                </div>
+                Mixing
+            </div>
+            <div class="step" id="step2">
+                 <div class="bottle-image-container">
+                    <img src="https://placehold.co/50x50/EEE/31343C?text=B2&font=Roboto" alt="Bottle">
+                </div>
+                Filling
+            </div>
+            <div class="step" id="step3">
+                 <div class="bottle-image-container">
+                    <img src="https://placehold.co/50x50/EEE/31343C?text=B3&font=Roboto" alt="Bottle">
+                </div>
+                Capping
+            </div>
+            <div class="step" id="step4">
+                 <div class="bottle-image-container">
+                    <img src="https://placehold.co/50x50/EEE/31343C?text=B4&font=Roboto" alt="Bottle">
+                </div>
+                Packaging
+            </div>
+        </div>
+        <div id="controls">
+            <button class="button" id="increaseButton1"></button>
+            <button class="button" id="increaseButton2"></button>
+            <button class="button" id="increaseButton3"></button>
+            <button class="button" id="increaseButton4"></button>
+        </div>
+        <div id="game-controls" style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 15px;">
+            <button class="button" id="resetButton">Reset Game</button>
+            <button class="button" id="overtimeButton">Activate Overtime</button>
+        </div>
+        <div id="message">Identify the bottleneck and improve capacity to maximize throughput!</div>
+        <div id="results">
+            <p>Throughput: <span id="throughputDisplay">0 bottles/min</span></p>
+            <p class="cost-display">Total Cost: $<span id="totalCost">0</span></p>
+        </div>
+        <div class="event-log">
+            <div class="event-log-entry">Game started!</div>
+        </div>
+        <div class="game-over-overlay" style="display: none;">
+            <div class="game-over-content">
+                <h2 class="game-over-title">Game Over</h2>
+                <p class="game-over-message">You've reached the target throughput!</p>
+                <p class="final-cost-message">Your Total Cost: $<span class="final-cost">0</span></p>
+                <button class="play-again-button button">Play Again</button>
+            </div>
+        </div>
+    </div>
+    <script>
+       // --- Game Setup ---
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d');
+        const messageDisplay = document.getElementById('message');
+        const throughputDisplay = document.getElementById('throughputDisplay');
+        const increaseButtons = [
+            document.getElementById('increaseButton1'),
+            document.getElementById('increaseButton2'),
+            document.getElementById('increaseButton3'),
+            document.getElementById('increaseButton4')
+        ];
+        const resetButton = document.getElementById('resetButton');
+        const overtimeButton = document.getElementById('overtimeButton');
+        const processSteps = [
+            document.getElementById('step1'),
+            document.getElementById('step2'),
+            document.getElementById('step3'),
+            document.getElementById('step4')
+        ];
+        let canvasWidth = document.querySelector('.container').clientWidth;
+        let canvasHeight = 300;
+        canvas.width = canvasWidth;
+        canvas.height = canvasHeight;
+        let processCapacities = [20, 15, 20, 25];  // Reduced initial capacities
+        let processBuffers = [0, 0, 0, 0];
+        let bottleneckStep = 1;
+        let throughput = 0;
+        let gameRunning = true;
+        let targetThroughput = 80;    // Increased target throughput
+        const uom = "bottles/min";
+        let totalCost = 0;
+        let eventLog = document.querySelector('.event-log');
+        let costDisplay = document.getElementById('totalCost');
+        let gameOverOverlay = document.querySelector('.game-over-overlay');
+        let playAgainButton = document.querySelector('.play-again-button');
+        let finalCostDisplay = document.querySelector('.final-cost');
+        let upgradeCosts = [1500, 2000, 1800, 1200]; // Increased upgrade costs
+        let overtimeCost = 750;
+        let isOvertimeActive = false;
+        let originalCapacities = [...processCapacities];
+        const stationEvents = [
+            ["Increase Mixing Capacity", "Mixing Station Overhaul", "Upgrade Mixer", "Mixing Line Improvement"],
+            ["Increase Filling Capacity", "Filling Station Upgrade", "New Filler Machine", "Filling Process Optimization"],
+            ["Increase Capping Capacity", "Capping Station Redesign", "Capping Machine Upgrade", "Capping Line Enhancement"],
+            ["Increase Packaging Capacity", "Packaging Station Automation", "New Packaging Tech", "Packaging Process Redesign"]
+        ];
+        function logEvent(message) {
+            let entry = document.createElement('div');
+            entry.classList.add('event-log-entry');
+            entry.textContent = message;
+            eventLog.appendChild(entry);
+            eventLog.scrollTop = eventLog.scrollHeight;
+        }
+        function drawBottle(x, y, stage) {
+            ctx.fillStyle = bottleColor;
+            ctx.strokeStyle = bottleOutlineColor;
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            ctx.moveTo(x, y);
+            ctx.lineTo(x + 10, y);
+            ctx.lineTo(x + 15, y - 15);
+            ctx.lineTo(x + 15, y - 30);
+            ctx.lineTo(x + 5, y - 40);
+            ctx.lineTo(x - 5, y - 40);
+            ctx.lineTo(x - 15, y - 30);
+            ctx.lineTo(x - 15, y - 15);
+            ctx.lineTo(x - 10, y);
+            ctx.closePath();
+            ctx.fill();
+            ctx.stroke();
+        }
+        function drawBuffer(x, y, level) {
+            ctx.fillStyle = bufferColor;
+            ctx.strokeStyle = bufferOutlineColor;
+            ctx.lineWidth = 2;
+            ctx.fillRect(x - 20, y - level * 3, 40, level * 3);
+            ctx.strokeRect(x - 20, y - level * 3, 40, level * 3);
+        }
+        function drawProcessStep(x, y, capacity, isBottleneck, stage) {
+            const width = 80;
+            const height = 40;
+            ctx.fillStyle = '#f0f0f0';
+            ctx.strokeStyle = '#e2e8f0';
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            ctx.roundRect(x - width / 2, y - height / 2, width, height, [5]);
+            ctx.fill();
+            ctx.stroke();
+            ctx.fillStyle = '#2d3748';
+            ctx.font = '12px "Press Start 2P"';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText(`Step ${stage}`, x, y - 10);
+            ctx.fillText(`${capacity} ${uom}`, x, y + 10);
+        }
+        function updateBottleneck() {
+            let minCapacity = Infinity;
+            bottleneckStep = 0;
+            for (let i = 0; i < processCapacities.length; i++) {
+                if (processCapacities[i] < minCapacity) {
+                    minCapacity = processCapacities[i];
+                    bottleneckStep = i + 1;
+                }
+            }
+            return minCapacity;
+        }
+        function calculateThroughput() {
+            throughput = updateBottleneck();
+            return throughput;
+        }
+        function increaseCapacity(step) {
+            if (!gameRunning) return;
+            if (step < 1 || step > processCapacities.length) {
+                console.error('Invalid step number');
+                return;
+            }
+            const upgradeCost = upgradeCosts[step - 1];
+            
+            // Random increment between 2 and 7 instead of fixed 5
+            const randomIncrement = Math.floor(Math.random() * 6) + 2; // Random number between 2-7
+            
+            processCapacities[step - 1] += randomIncrement;
+            originalCapacities[step - 1] += randomIncrement; // Also update original capacities for overtime calculations
+            
+            totalCost += upgradeCost;
+            costDisplay.textContent = totalCost;
+            logEvent(`Increased capacity of Step ${step} by ${randomIncrement} for $${upgradeCost}!`);
+            calculateThroughput();
+            throughputDisplay.textContent = `${throughput} ${uom}`;
+            if (throughput >= targetThroughput) {
+                gameOver();
+            }
+        }
+        function resetGame() {
+            processCapacities = [20, 15, 20, 25];  // Reduced initial capacities
+            originalCapacities = [...processCapacities];
+            processBuffers = [0, 0, 0, 0];
+            bottleneckStep = 1;
+            throughput = 0;
+            gameRunning = true;
+            totalCost = 0;
+            costDisplay.textContent = totalCost;
+            messageDisplay.textContent = 'Game reset! Identify the bottleneck and improve capacity!';
+            throughputDisplay.textContent = `${throughput} ${uom}`;
+            processSteps.forEach((step, index) => {
+                step.classList.remove('bottleneck');
+            });
+            processSteps[0].classList.add('bottleneck');
+            eventLog.innerHTML = '<div class="event-log-entry">Game started!</div>';
+            hideGameOverScreen();
+            isOvertimeActive = false;
+            overtimeButton.textContent = "Activate Overtime";
+            animate();
+        }
+
+
+        function activateOvertime() {
+            if (!gameRunning || isOvertimeActive) return;
+            isOvertimeActive = true;
+            totalCost += overtimeCost;
+            costDisplay.textContent = totalCost;
+            logEvent(`Overtime activated! +20% capacity, Cost: $${overtimeCost}`);
+            processCapacities = processCapacities.map(capacity => capacity * 1.2);
+            overtimeButton.textContent = "Overtime Active";
+            setTimeout(() => {
+                isOvertimeActive = false;
+                processCapacities = [...originalCapacities];
+                logEvent("Overtime ended!");
+                overtimeButton.textContent = "Activate Overtime";
+            }, 10000);
+        }
+        function gameOver() {
+            gameRunning = false;
+            finalCostDisplay.textContent = totalCost;
+            showGameOverScreen();
+        }
+        // --- Event Listeners ---
+        increaseButtons.forEach((button, index) => {
+            button.addEventListener('click', () => increaseCapacity(index + 1));
+        });
+        resetButton.addEventListener('click', resetGame);
+        overtimeButton.addEventListener('click', activateOvertime);
+        playAgainButton.addEventListener('click', resetGame);
+        // --- Animation Loop ---
+        function animate() {
+            if (!gameRunning) return;
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            const stageWidth = canvas.width / processCapacities.length;
+            processCapacities.forEach((capacity, index) => {
+                const x = stageWidth * (index + 0.5);
+                const y = canvasHeight / 2 + 30;
+                const isBottleneck = index + 1 === bottleneckStep;
+                drawProcessStep(x, y, capacity, false, index + 1);
+            });
+            throughputDisplay.textContent = `${calculateThroughput()} ${uom}`;
+            requestAnimationFrame(animate);
+        }
+        // --- Game Over Screen ---
+        function showGameOverScreen() {
+            gameOverOverlay.style.display = 'flex';
+            gameRunning = false;
+        }
+        function hideGameOverScreen() {
+            gameOverOverlay.style.display = 'none';
+            gameRunning = true;
+        }
+        
+        // Update the styling for the controls to align buttons with stations
+        function updateControlLayout() {
+            // Set each upgrade button to be positioned under its station
+            for (let i = 0; i < increaseButtons.length; i++) {
+                const stepWidth = document.getElementById(`step${i+1}`).offsetWidth;
+                increaseButtons[i].style.width = stepWidth + 'px';
+                increaseButtons[i].style.margin = '0 auto';
+            }
+        }
+        
+        // --- Start Game on Load ---
+        window.onload = () => {
+            function resizeCanvas() {
+                canvasWidth = document.querySelector('.container').clientWidth;
+                canvas.width = canvasWidth;
+                canvas.height = 300; // Keep a max height
+            }
+            resizeCanvas();
+            window.addEventListener('resize', resizeCanvas);
+            resetGame();
+            increaseButtons.forEach((button, index) => {
+                button.textContent = stationEvents[index][Math.floor(Math.random() * stationEvents[index].length)];
+            });
+            
+            // Add this to apply the alignment on load
+            setTimeout(updateControlLayout, 100);
+            window.addEventListener('resize', updateControlLayout);
+        };
+    </script>
+</body>
+</html>

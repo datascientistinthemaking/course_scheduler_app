@@ -24,6 +24,7 @@ def create_excel_template():
     trainer_data = pd.DataFrame({
         'Name': ['Trainer 1', 'Trainer 2', 'Trainer 3', 'Trainer 4', 'Trainer 5'],
         'Title': ['Champion', 'Consultant', 'Senior Consultant', 'Partner', 'Freelancer'],
+        'Min_Days': [120, 100, 140, 160, 0],  # Minimum days (0 for freelancers)
         'Max_Days': [150, 120, 180, 200, 100]
     })
     trainer_data.to_excel(writer, sheet_name='TrainerData', index=False)

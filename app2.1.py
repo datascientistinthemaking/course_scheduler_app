@@ -34,6 +34,65 @@ class CourseScheduler:
         self.fleximatrix = {}  # Dictionary mapping (course, language) to list of qualified trainers
         self.course_champions = {}  # Dictionary to store champions for each course
 
+    def _sample_courses_for_optimization(self, course_data, max_courses=500):
+        """
+        Sample courses for optimization when dealing with extremely large problems.
+        Prioritizes courses based on various factors.
+        
+        Args:
+            course_data: DataFrame containing course information
+            max_courses: Maximum number of courses to include in optimization
+            
+        Returns:
+            DataFrame containing sampled courses
+        """
+        # Create a copy to avoid modifying original
+        df = course_data.copy()
+        
+        # Calculate priority score for each course
+        df['priority_score'] = 0
+        
+        # Factor 1: Number of qualified trainers (fewer trainers = higher priority)
+        df['qualified_trainers'] = df.apply(
+            lambda row: len(self.fleximatrix.get((row['Course Name'], row['Language']), [])), 
+            axis=1
+        )
+        df['trainer_score'] = 1 / (df['qualified_trainers'] + 1)  # Add 1 to avoid division by zero
+        
+        # Factor 2: Course duration (longer courses = higher priority)
+        df['duration_score'] = df['Duration'] / df['Duration'].max()
+        
+        # Factor 3: Number of runs (more runs = higher priority)
+        df['runs_score'] = df['Runs'] / df['Runs'].max()
+        
+        # Factor 4: Champion courses get priority
+        df['is_champion'] = df.apply(
+            lambda row: 1 if (row['Course Name'], row['Language']) in self.course_champions else 0,
+            axis=1
+        )
+        
+        # Combine factors into final priority score
+        df['priority_score'] = (
+            df['trainer_score'] * 0.3 +  # Limited trainers is important
+            df['duration_score'] * 0.2 +  # Longer courses need more planning
+            df['runs_score'] * 0.3 +      # More runs need more coordination
+            df['is_champion'] * 0.2        # Champion courses get some priority
+        )
+        
+        # Sort by priority score and select top courses
+        df = df.sort_values('priority_score', ascending=False)
+        
+        # Calculate total runs and trim until we're under max_courses
+        total_runs = df['Runs'].cumsum()
+        df = df[total_runs <= max_courses].copy()
+        
+        # Drop the temporary columns we added
+        df = df.drop(['priority_score', 'qualified_trainers', 'trainer_score', 
+                     'duration_score', 'runs_score', 'is_champion'], axis=1)
+        
+        print(f"Sampled {len(df)} courses with {df['Runs'].sum()} total runs")
+        return df
+
     def load_data_from_excel(self, uploaded_file):
         """Load all required data from an Excel file with multiple sheets"""
         try:
@@ -256,16 +315,74 @@ class CourseScheduler:
         title = self.consultant_data.loc[self.consultant_data["Name"] == trainer_name, "Title"].iloc[0]
         return title == "Freelancer"
 
+    def needs_minimum_workload(self, trainer_name):
+        """Check if trainer needs minimum workload based on their title"""
+        title = self.consultant_data.loc[self.consultant_data["Name"] == trainer_name, "Title"].iloc[0]
+        return title in ["Consultant", "Senior Consultant", "Partner"]
+
+    def _create_objective_function(self, model, penalties, mode="regular", weights=None):
+        """Create the objective function based on the specified mode and weights.
+        
+        Args:
+            model: The CP-SAT model
+            penalties: Dictionary containing all penalty variables
+            mode: One of "regular", "prioritize_all", or "incremental"
+            weights: Optional dictionary of weights to override defaults
+        """
+        default_weights = {
+            "regular": {
+                "affinity": 2,
+                "champion": 4,
+                "utilization": 3,
+                "monthly": 5
+            },
+            "prioritize_all": {
+                "unscheduled": 50,
+                "workload": 30,
+                "spacing": 20,
+                "monthly": 5,
+                "affinity": 2,
+                "champion": 4,
+                "utilization": 3
+            }
+        }
+
+        # Use provided weights or defaults
+        active_weights = weights or default_weights[mode]
+
+        if mode == "regular":
+            return model.Minimize(
+                active_weights["affinity"] * sum(penalties["affinity"]) +
+                active_weights["champion"] * sum(penalties["champion"]) +
+                active_weights["utilization"] * sum(penalties["utilization"])
+            )
+        elif mode == "prioritize_all":
+            return model.Minimize(
+                active_weights["unscheduled"] * sum(penalties["unscheduled"]) +
+                active_weights["workload"] * sum(penalties["workload"]) +
+                active_weights["spacing"] * sum(penalties["spacing"]) +
+                active_weights["monthly"] * sum(penalties["monthly"]) +
+                active_weights["affinity"] * sum(penalties["affinity"]) +
+                active_weights["champion"] * sum(penalties["champion"]) +
+                active_weights["utilization"] * sum(penalties["utilization"])
+            )
+        elif mode == "incremental":
+            return model.Minimize(
+                2 * sum(penalties["affinity"]) +
+                4 * sum(penalties["champion"]) +
+                3 * sum(penalties["utilization"])
+            )
+        else:
+            raise ValueError(f"Unknown optimization mode: {mode}")
+
     def run_optimization(self, monthly_weight=5, champion_weight=4,
                          utilization_weight=3, affinity_weight=2,
                          utilization_target=70, solver_time_minutes=5,
                          num_workers=8, min_course_spacing=2,
                          solution_strategy="BALANCED",
                          enforce_monthly_distribution=False,
-                         max_affinity_constraints=50,
                          prioritize_all_courses=False,
-                         accelerated_mode=False,
-                         progress_callback=None):  # Add progress callback parameter
+                         progress_callback=None):
 
         # Helper function to log and update progress
         def log_progress(message, percent=None):
@@ -279,42 +396,28 @@ class CourseScheduler:
                     progress_callback(percent, message)
         
         # Apply accelerated mode optimizations if enabled
-        if accelerated_mode:
+        if prioritize_all_courses:
             log_progress("Running in accelerated mode - applying speed optimizations...", 0.01)
             
             # Check model size to determine level of acceleration needed
             total_courses = sum(self.course_run_data["Runs"])
             
             if total_courses > 500:
-                log_progress(f"Extremely large problem detected ({total_courses} courses) - applying maximum optimizations", 0.02)
-                # Maximum optimizations for extremely large problems
-                max_affinity_constraints = 0  # Disable affinity constraints completely
+                log_progress(f"Extremely large problem detected ({total_courses} courses) - applying optimizations", 0.02)
+                # Apply optimizations but keep ALL affinity constraints
                 solution_strategy = "FIND_FEASIBLE_FAST"
                 num_workers = min(32, os.cpu_count() or 8)  # Use all available CPU cores if possible
-                monthly_weight = 1  # Minimal monthly distribution weight
-                champion_weight = 1  # Minimal champion weight
-                utilization_weight = 1  # Minimal utilization weight
-                min_course_spacing = 1  # Minimum possible spacing
+                min_course_spacing = max(1, min_course_spacing - 1)  # Reduce spacing but keep at least 1
                 # Drastically shorten time limit
                 solver_time_minutes = min(solver_time_minutes, 5)
                 
-                # Apply sampling for extremely large problems - only optimize a subset of courses
-                if total_courses > 700:
-                    log_progress("Applying course sampling for enormous problem - will optimize in batches", 0.03)
-                    # We'll need to sample courses by sorting by priority and taking most important ones
-                    self.course_run_data = self._sample_courses_for_optimization(self.course_run_data, max_courses=500)
-                    log_progress(f"Reduced to {sum(self.course_run_data['Runs'])} highest priority courses", 0.04)
-                
-                log_progress("Maximum optimizations applied - sacrificing constraint quality for speed", 0.05)
+                log_progress("Optimizations applied while preserving ALL affinity constraints", 0.05)
             elif total_courses > 300:
                 log_progress(f"Large problem detected ({total_courses} courses) - applying aggressive optimizations", 0.02)
                 # Very aggressive settings for large problems
                 max_affinity_constraints = max(3, max_affinity_constraints // 8)
                 solution_strategy = "FIND_FEASIBLE_FAST"
                 num_workers = min(16, num_workers * 2)
-                monthly_weight = monthly_weight // 4
-                champion_weight = champion_weight // 4
-                utilization_weight = utilization_weight // 4
                 min_course_spacing = 1  # Minimum possible spacing
                 # Shorten time limit to avoid excessive solving
                 solver_time_minutes = min(solver_time_minutes, 10)
@@ -324,9 +427,6 @@ class CourseScheduler:
                 max_affinity_constraints = max(5, max_affinity_constraints // 4)
                 solution_strategy = "FIND_FEASIBLE_FAST"
                 num_workers = min(16, num_workers * 2)
-                monthly_weight = monthly_weight // 2
-                champion_weight = champion_weight // 2
-                utilization_weight = utilization_weight // 2
                 min_course_spacing = max(1, min_course_spacing - 1)
 
         # Get total F2F runs
@@ -372,8 +472,9 @@ class CourseScheduler:
         affinity_penalties = []
         trainer_utilization_penalties = []
         champion_assignment_penalties = []
-        unscheduled_course_penalties = []  # New list for unscheduled course penalties
-        unscheduled_courses = []  # Declare this variable to track unscheduled courses
+        unscheduled_course_penalties = []  # For unscheduled courses
+        workload_violation_penalties = []  # For workload violations
+        spacing_violation_penalties = []   # For course spacing violations
 
         # Create the schedule variables for each course and run
         for _, row in self.course_run_data.iterrows():
@@ -382,8 +483,8 @@ class CourseScheduler:
                     row["Runs"], row["Duration"]
 
                 for i in range(runs):
-                    # Create a variable for the start week
-                    start_week = model.NewIntVar(1, max_weeks, f"start_week_{course}_{i}")
+                    # Create a variable for the start week that includes 0 (unscheduled)
+                    start_week = model.NewIntVar(0, max_weeks, f"start_week_{course}_{i}")
                     schedule[(course, delivery_type, language, i)] = start_week
 
                     # Create trainer assignment variable
@@ -395,38 +496,29 @@ class CourseScheduler:
                     trainer_var = model.NewIntVar(0, len(qualified_trainers) - 1, f"trainer_{course}_{i}")
                     trainer_assignments[(course, delivery_type, language, i)] = trainer_var
 
+                    # Track if course is scheduled
+                    is_scheduled = model.NewBoolVar(f"{course}_{i}_is_scheduled")
+                    model.Add(start_week > 0).OnlyEnforceIf(is_scheduled)
+                    model.Add(start_week == 0).OnlyEnforceIf(is_scheduled.Not())
+                    unscheduled_course_penalties.append(is_scheduled.Not())
+
                     # Only schedule in weeks with enough working days AND available trainers
                     valid_weeks = []
                     for w, days in self.weekly_working_days.items():
                         if days >= duration:
-                            # WEEK RESTRICTION CHECK: Skip if this course can't run in this week position
-                            if course in self.week_restrictions:
-                                # Get week position info
-                                week_info = self.week_position_in_month.get(w, {})
-
-                                # Check each restriction type
-                                skip_week = False
-
-                                if week_info.get('is_first') and self.week_restrictions[course].get('First', False):
-                                    skip_week = True
-                                elif week_info.get('is_second') and self.week_restrictions[course].get('Second', False):
-                                    skip_week = True
-                                elif week_info.get('is_third') and self.week_restrictions[course].get('Third', False):
-                                    skip_week = True
-                                elif week_info.get('is_fourth') and self.week_restrictions[course].get('Fourth', False):
-                                    skip_week = True
-                                elif week_info.get('is_last') and self.week_restrictions[course].get('Last', False):
-                                    skip_week = True
-
-                                if skip_week:
-                                    # Skip this week for this course due to restriction
-                                    continue
-
-                            # Check if at least one qualified trainer is available this week
                             for trainer in qualified_trainers:
                                 if self.is_trainer_available(trainer, w):
                                     valid_weeks.append(w)
                                     break
+
+                    if valid_weeks:
+                        # Convert hard constraint to soft constraint
+                        for w in range(1, max_weeks + 1):
+                            if w not in valid_weeks:
+                                is_invalid_week = model.NewBoolVar(f"{course}_{i}_invalid_week_{w}")
+                                model.Add(start_week == w).OnlyEnforceIf(is_invalid_week)
+                                model.Add(start_week != w).OnlyEnforceIf(is_invalid_week.Not())
+                                unscheduled_course_penalties.append(is_invalid_week)
 
                     if valid_weeks:
                         model.AddAllowedAssignments([start_week], [[w] for w in valid_weeks])
@@ -511,6 +603,63 @@ class CourseScheduler:
 
                     print(f"  Month {month}: Target of {target_demand} courses (soft constraint with penalty)")
 
+        # NEW CONSTRAINT: Ensure courses with more than 4 runs have at least one run in each quarter
+        print("Adding quarterly distribution constraints for courses with more than 4 runs")
+        
+        # Define quarters
+        quarters = {
+            1: [1, 2, 3],      # Q1: Jan-Mar
+            2: [4, 5, 6],      # Q2: Apr-Jun
+            3: [7, 8, 9],      # Q3: Jul-Sep
+            4: [10, 11, 12]    # Q4: Oct-Dec
+        }
+        
+        # Group course runs by course and language
+        course_runs = {}
+        for (course, delivery_type, language, i), week_var in schedule.items():
+            key = (course, language)
+            if key not in course_runs:
+                course_runs[key] = []
+            course_runs[key].append((i, week_var))
+        
+        # Add quarterly constraints for courses with more than 4 runs
+        # Get actual run counts from course_run_data
+        for (course, language), runs in course_runs.items():
+            # Get the actual number of runs from course_run_data
+            run_count = self.course_run_data[
+                (self.course_run_data['Course Name'] == course) & 
+                (self.course_run_data['Language'] == language)
+            ]['Runs'].iloc[0]
+            
+            if run_count > 4:
+                print(f"  Adding quarterly constraints for {course} ({language}) with {run_count} runs")
+                
+                # For each quarter, create variables to track if at least one run is scheduled in it
+                for quarter, months in quarters.items():
+                    # Get all weeks in this quarter
+                    quarter_weeks = [week for week, month in self.week_to_month_map.items() if month in months]
+                    
+                    # Create variables for each run to track if it's in this quarter
+                    runs_in_quarter = []
+                    for run_num, week_var in runs:
+                        is_in_quarter = model.NewBoolVar(f"{course}_{language}_{run_num}_in_q{quarter}")
+                        
+                        # Add constraints: is_in_quarter is True if week_var is in any week of the quarter
+                        week_choices = []
+                        for week in quarter_weeks:
+                            is_in_week = model.NewBoolVar(f"{course}_{language}_{run_num}_in_week_{week}")
+                            model.Add(week_var == week).OnlyEnforceIf(is_in_week)
+                            model.Add(week_var != week).OnlyEnforceIf(is_in_week.Not())
+                            week_choices.append(is_in_week)
+                        
+                        model.AddBoolOr(week_choices).OnlyEnforceIf(is_in_quarter)
+                        model.AddBoolAnd([choice.Not() for choice in week_choices]).OnlyEnforceIf(is_in_quarter.Not())
+                        
+                        runs_in_quarter.append(is_in_quarter)
+                    
+                    # Add constraint: at least one run must be in this quarter
+                    model.Add(sum(runs_in_quarter) >= 1)
+
         # CONSTRAINT 2: Minimum spacing between runs of same course
         print("Adding spacing between runs of the same course")
 
@@ -535,12 +684,8 @@ class CourseScheduler:
         log_progress("Adding affinity constraints for course pairs...", 0.50)
         print(f"Adding affinity constraints for course pairs")
 
-        # Define maximum affinity constraints to add (parameter)
-        affinity_count = 0
         # Add constraints for course affinities (soft constraints/penalties)
         for _, row in self.affinity_matrix_data.iterrows():
-            if affinity_count >= max_affinity_constraints:
-                break
 
             c1, c2, gap_weeks = row["Course 1"], row["Course 2"], row["Gap Weeks"]
 
@@ -561,109 +706,86 @@ class CourseScheduler:
             c1_runs.sort(key=lambda x: x[0])
             c2_runs.sort(key=lambda x: x[0])
 
-            affinity_count += 1
+            
 
             # Only check first run of each course to reduce constraints
             run1, var1 = c1_runs[0]
             run2, var2 = c2_runs[0]
 
             # Create variables to check if either course is in Q4
-            is_c1_q4 = model.NewBoolVar(f"{c1}_{run1}_in_q4")
-            is_c2_q4 = model.NewBoolVar(f"{c2}_{run2}_in_q4")
+            is_c1_q4 = model.NewBoolVar(f"{c1}_{run1}_in_last_term")
+            is_c2_q4 = model.NewBoolVar(f"{c2}_{run2}_in_last_term")
 
-            # Get Q4 weeks
-            q4_weeks = [w for w, m in self.week_to_month_map.items() if m in [10, 11, 12]]
+            # Get last term weeks (Sep-Dec, months 9-12)
+            last_term_weeks = [w for w, m in self.week_to_month_map.items() if m in [9, 10, 11, 12]]
 
-            # Set up Q4 detection for course 1
-            c1_q4_choices = []
-            for week in q4_weeks:
+            # Set up last term detection for course 1
+            c1_last_term_choices = []
+            for week in last_term_weeks:
                 is_in_this_week = model.NewBoolVar(f"{c1}_{run1}_in_week_{week}")
                 model.Add(var1 == week).OnlyEnforceIf(is_in_this_week)
                 model.Add(var1 != week).OnlyEnforceIf(is_in_this_week.Not())
-                c1_q4_choices.append(is_in_this_week)
+                c1_last_term_choices.append(is_in_this_week)
 
-            model.AddBoolOr(c1_q4_choices).OnlyEnforceIf(is_c1_q4)
-            model.AddBoolAnd([choice.Not() for choice in c1_q4_choices]).OnlyEnforceIf(is_c1_q4.Not())
+            model.AddBoolOr(c1_last_term_choices).OnlyEnforceIf(is_c1_q4)
+            model.AddBoolAnd([choice.Not() for choice in c1_last_term_choices]).OnlyEnforceIf(is_c1_q4.Not())
 
-            # Set up Q4 detection for course 2
-            c2_q4_choices = []
-            for week in q4_weeks:
+            # Set up last term detection for course 2
+            c2_last_term_choices = []
+            for week in last_term_weeks:
                 is_in_this_week = model.NewBoolVar(f"{c2}_{run2}_in_week_{week}")
                 model.Add(var2 == week).OnlyEnforceIf(is_in_this_week)
                 model.Add(var2 != week).OnlyEnforceIf(is_in_this_week.Not())
-                c2_q4_choices.append(is_in_this_week)
+                c2_last_term_choices.append(is_in_this_week)
 
-            model.AddBoolOr(c2_q4_choices).OnlyEnforceIf(is_c2_q4)
-            model.AddBoolAnd([choice.Not() for choice in c2_q4_choices]).OnlyEnforceIf(is_c2_q4.Not())
+            model.AddBoolOr(c2_last_term_choices).OnlyEnforceIf(is_c2_q4)
+            model.AddBoolAnd([choice.Not() for choice in c2_last_term_choices]).OnlyEnforceIf(is_c2_q4.Not())
 
-            # Either course is in Q4
-            either_in_q4 = model.NewBoolVar(f"either_{c1}_{c2}_in_q4")
-            model.AddBoolOr([is_c1_q4, is_c2_q4]).OnlyEnforceIf(either_in_q4)
-            model.AddBoolAnd([is_c1_q4.Not(), is_c2_q4.Not()]).OnlyEnforceIf(either_in_q4.Not())
+            # Either course is in last term
+            either_in_last_term = model.NewBoolVar(f"either_{c1}_{c2}_in_last_term")
+            model.AddBoolOr([is_c1_q4, is_c2_q4]).OnlyEnforceIf(either_in_last_term)
+            model.AddBoolAnd([is_c1_q4.Not(), is_c2_q4.Not()]).OnlyEnforceIf(either_in_last_term.Not())
 
-            # Soft affinity constraint with reduced gap for Q4
+            # Soft affinity constraint with reduced gap for last term
             too_close = model.NewBoolVar(f"affinity_too_close_{c1}_{c2}_{run1}_{run2}")
 
-            # Regular gap weeks for non-Q4
+            # Regular gap weeks for non-last term
             far_enough_after_normal = model.NewBoolVar(f"far_after_{c1}_{c2}_{run1}_{run2}_normal")
             far_enough_before_normal = model.NewBoolVar(f"far_before_{c1}_{c2}_{run1}_{run2}_normal")
 
-            # Reduced gap weeks (50% reduction) for Q4
-            reduced_gap = max(1, gap_weeks // 2)  # Ensure minimum 1 week gap
-            far_enough_after_q4 = model.NewBoolVar(f"far_after_{c1}_{c2}_{run1}_{run2}_q4")
-            far_enough_before_q4 = model.NewBoolVar(f"far_before_{c1}_{c2}_{run1}_{run2}_q4")
+            # Reduced gap weeks for last term (Sep-Dec)
+            reduced_gap = max(1, gap_weeks - 1)  # Reduce by 1 week, minimum 1 week gap
+            far_enough_after_last_term = model.NewBoolVar(f"far_after_{c1}_{c2}_{run1}_{run2}_last_term")
+            far_enough_before_last_term = model.NewBoolVar(f"far_before_{c1}_{c2}_{run1}_{run2}_last_term")
 
             # Normal gap constraints
-            model.Add(var2 >= var1 + gap_weeks).OnlyEnforceIf(far_enough_after_normal)
-            model.Add(var2 < var1 + gap_weeks).OnlyEnforceIf(far_enough_after_normal.Not())
+            model.Add(var2 >= var1 + gap_weeks).OnlyEnforceIf([far_enough_after_normal, either_in_last_term.Not()])
+            model.Add(var2 <= var1 - gap_weeks).OnlyEnforceIf([far_enough_before_normal, either_in_last_term.Not()])
 
-            model.Add(var1 >= var2 + gap_weeks).OnlyEnforceIf(far_enough_before_normal)
-            model.Add(var1 < var2 + gap_weeks).OnlyEnforceIf(far_enough_before_normal.Not())
+            # Reduced gap constraints for last term
+            model.Add(var2 >= var1 + reduced_gap).OnlyEnforceIf([far_enough_after_last_term, either_in_last_term])
+            model.Add(var2 <= var1 - reduced_gap).OnlyEnforceIf([far_enough_before_last_term, either_in_last_term])
 
-            # Q4 gap constraints (reduced)
-            model.Add(var2 >= var1 + reduced_gap).OnlyEnforceIf(far_enough_after_q4)
-            model.Add(var2 < var1 + reduced_gap).OnlyEnforceIf(far_enough_after_q4.Not())
+            # Combine normal and last term constraints
+            model.AddBoolOr([far_enough_after_normal, far_enough_before_normal]).OnlyEnforceIf([too_close.Not(), either_in_last_term.Not()])
+            model.AddBoolOr([far_enough_after_last_term, far_enough_before_last_term]).OnlyEnforceIf([too_close.Not(), either_in_last_term])
 
-            model.Add(var1 >= var2 + reduced_gap).OnlyEnforceIf(far_enough_before_q4)
-            model.Add(var1 < var2 + reduced_gap).OnlyEnforceIf(far_enough_before_q4.Not())
-
-            # Logic for too_close based on regular or Q4 gaps
-            # Not too close if:
-            # (NOT in Q4 AND (far enough apart in either direction))
-            # OR
-            # (In Q4 AND (far enough apart with reduced gap in either direction))
-            far_enough_normal = model.NewBoolVar(f"far_enough_{c1}_{c2}_{run1}_{run2}_normal")
-            model.AddBoolOr([far_enough_after_normal, far_enough_before_normal]).OnlyEnforceIf(far_enough_normal)
-            model.AddBoolAnd([far_enough_after_normal.Not(), far_enough_before_normal.Not()]).OnlyEnforceIf(
-                far_enough_normal.Not())
-
-            far_enough_q4 = model.NewBoolVar(f"far_enough_{c1}_{c2}_{run1}_{run2}_q4")
-            model.AddBoolOr([far_enough_after_q4, far_enough_before_q4]).OnlyEnforceIf(far_enough_q4)
-            model.AddBoolAnd([far_enough_after_q4.Not(), far_enough_before_q4.Not()]).OnlyEnforceIf(far_enough_q4.Not())
-
-            # Not too close if appropriate gap is maintained based on Q4 status
-            not_too_close_normal = model.NewBoolVar(f"not_too_close_normal_{c1}_{c2}_{run1}_{run2}")
-            model.AddBoolAnd([either_in_q4.Not(), far_enough_normal]).OnlyEnforceIf(not_too_close_normal)
-            model.AddBoolOr([either_in_q4, far_enough_normal.Not()]).OnlyEnforceIf(not_too_close_normal.Not())
-
-            not_too_close_q4 = model.NewBoolVar(f"not_too_close_q4_{c1}_{c2}_{run1}_{run2}")
-            model.AddBoolAnd([either_in_q4, far_enough_q4]).OnlyEnforceIf(not_too_close_q4)
-            model.AddBoolOr([either_in_q4.Not(), far_enough_q4.Not()]).OnlyEnforceIf(not_too_close_q4.Not())
-
-            # Final too_close logic
-            model.AddBoolOr([not_too_close_normal, not_too_close_q4]).OnlyEnforceIf(too_close.Not())
-            model.AddBoolAnd([not_too_close_normal.Not(), not_too_close_q4.Not()]).OnlyEnforceIf(too_close)
+            # Add violation constraints
+            model.Add(var2 < var1 + reduced_gap).OnlyEnforceIf([too_close, either_in_last_term])
+            model.Add(var2 > var1 - reduced_gap).OnlyEnforceIf([too_close, either_in_last_term])
+            model.Add(var2 < var1 + gap_weeks).OnlyEnforceIf([too_close, either_in_last_term.Not()])
+            model.Add(var2 > var1 - gap_weeks).OnlyEnforceIf([too_close, either_in_last_term.Not()])
 
             # Add penalty for being too close
             for _ in range(affinity_weight):
                 affinity_penalties.append(too_close)
 
-            print(f"  Added affinity constraint: {c1} and {c2} should be {gap_weeks} weeks apart (reduced to {reduced_gap} in Q4)")
+            print(f"  Added affinity constraint: {c1} and {c2} should be {gap_weeks} weeks apart (reduced to {reduced_gap} in last term Sep-Dec)")
             
             # Log each affinity constraint with shortened course names for readability
             c1_short = c1[:40] + "..." if len(c1) > 40 else c1
             c2_short = c2[:40] + "..." if len(c2) > 40 else c2
-            log_message = f"Added affinity constraint: {c1_short} and {c2_short} should be {gap_weeks} weeks apart (reduced to {reduced_gap} in Q4)"
+            log_message = f"Added affinity constraint: {c1_short} and {c2_short} should be {gap_weeks} weeks apart (reduced to {reduced_gap} in last term Sep-Dec)"
             log_progress(log_message)
 
         # CONSTRAINT 4: Trainer-specific constraints
@@ -731,7 +853,7 @@ class CourseScheduler:
             max_days = self.consultant_data.loc[self.consultant_data["Name"] == trainer, "Max_Days"].iloc[0]
 
             # Calculate total workload
-            total_workload = model.NewIntVar(0, max_days, f"total_workload_{trainer}")
+            total_workload = model.NewIntVar(0, max_days * 2, f"total_workload_{trainer}")  # Allow exceeding max but penalize
             weighted_sum = []
             for is_assigned, duration in workload_items:
                 weighted_sum.append((is_assigned, duration))
@@ -744,25 +866,19 @@ class CourseScheduler:
                     model.Add(term == 0).OnlyEnforceIf(is_assigned.Not())
                     weighted_terms.append(term)
                 model.Add(total_workload == sum(weighted_terms))
-                # Enforce maximum workload
-                model.Add(total_workload <= max_days)
+                
+                # Convert hard workload constraints to soft constraints
+                over_max = model.NewBoolVar(f"{trainer}_over_max")
+                model.Add(total_workload > max_days).OnlyEnforceIf(over_max)
+                model.Add(total_workload <= max_days).OnlyEnforceIf(over_max.Not())
+                workload_violation_penalties.append(over_max)
 
-                # 4.4: For non-freelancers, encourage higher utilization (soft constraint)
-                if not self.is_freelancer(trainer):
-                    # Calculate target utilization as a percentage of max days
-                    target_days = int(max_days * (utilization_target / 100))  # Use the parameter
-
-                    # Add penalty for underutilization
-                    under_target = model.NewBoolVar(f"{trainer}_under_target")
-                    model.Add(total_workload < target_days).OnlyEnforceIf(under_target)
-                    model.Add(total_workload >= target_days).OnlyEnforceIf(under_target.Not())
-
-                    # Higher priority trainers get stronger penalty for underutilization
-                    priority = self.get_trainer_priority(trainer)
-                    penalty_weight = 7 - priority  # Invert priority (1 becomes 6, 6 becomes 1)
-
-                    for _ in range(penalty_weight):
-                        trainer_utilization_penalties.append(under_target)
+                # Add minimum workload constraint for specific titles
+                if self.needs_minimum_workload(trainer):
+                    under_min = model.NewBoolVar(f"{trainer}_under_min")
+                    model.Add(total_workload < 140).OnlyEnforceIf(under_min)
+                    model.Add(total_workload >= 140).OnlyEnforceIf(under_min.Not())
+                    workload_violation_penalties.append(under_min)
 
         # NEW CODE: Add constraint to prevent trainers from teaching multiple courses in same week
         # Add this right after the trainer workload constraints
@@ -893,7 +1009,9 @@ class CourseScheduler:
 
             # Combined objective function with course scheduling priority
             model.Minimize(
-                unscheduled_weight * sum(unscheduled_course_penalties) +
+                50 * sum(unscheduled_course_penalties) +  # Highest priority
+                30 * sum(workload_violation_penalties) +   # Second priority
+                20 * sum(spacing_violation_penalties) +    # Third priority
                 monthly_weight * sum(month_deviation_penalties) +
                 affinity_weight * sum(affinity_penalties) +
                 champion_weight * sum(champion_assignment_penalties) +
@@ -995,7 +1113,7 @@ class CourseScheduler:
         
         try:
             # For extremely large problems, try a simpler approach first
-            if accelerated_mode and sum(self.course_run_data["Runs"]) > 500:
+            if prioritize_all_courses and sum(self.course_run_data["Runs"]) > 500:
                 log_progress("Using simplified solver approach for extremely large problem", 0.70)
                 # Don't use callback for very large problems - it can cause crashes
                 status = solver.Solve(model)
@@ -1354,69 +1472,71 @@ class CourseScheduler:
             run2, var2 = c2_runs[0]
 
             # Create variables to check if either course is in Q4
-            is_c1_q4 = model.NewBoolVar(f"{c1}_{run1}_in_q4")
-            is_c2_q4 = model.NewBoolVar(f"{c2}_{run2}_in_q4")
+            is_c1_q4 = model.NewBoolVar(f"{c1}_{run1}_in_last_term")
+            is_c2_q4 = model.NewBoolVar(f"{c2}_{run2}_in_last_term")
 
-            # Get Q4 weeks
-            q4_weeks = [w for w, m in self.week_to_month_map.items() if m in [10, 11, 12]]
+            # Get last term weeks (Sep-Dec, months 9-12)
+            last_term_weeks = [w for w, m in self.week_to_month_map.items() if m in [9, 10, 11, 12]]
 
-            # Set up Q4 detection for course 1
-            c1_q4_choices = []
-            for week in q4_weeks:
+            # Set up last term detection for course 1
+            c1_last_term_choices = []
+            for week in last_term_weeks:
                 is_in_this_week = model.NewBoolVar(f"{c1}_{run1}_in_week_{week}")
                 model.Add(var1 == week).OnlyEnforceIf(is_in_this_week)
                 model.Add(var1 != week).OnlyEnforceIf(is_in_this_week.Not())
-                c1_q4_choices.append(is_in_this_week)
-            model.AddBoolOr(c1_q4_choices).OnlyEnforceIf(is_c1_q4)
-            model.AddBoolAnd([choice.Not() for choice in c1_q4_choices]).OnlyEnforceIf(is_c1_q4.Not())
+                c1_last_term_choices.append(is_in_this_week)
 
-            # Set up Q4 detection for course 2
-            c2_q4_choices = []
-            for week in q4_weeks:
+            model.AddBoolOr(c1_last_term_choices).OnlyEnforceIf(is_c1_q4)
+            model.AddBoolAnd([choice.Not() for choice in c1_last_term_choices]).OnlyEnforceIf(is_c1_q4.Not())
+
+            # Set up last term detection for course 2
+            c2_last_term_choices = []
+            for week in last_term_weeks:
                 is_in_this_week = model.NewBoolVar(f"{c2}_{run2}_in_week_{week}")
                 model.Add(var2 == week).OnlyEnforceIf(is_in_this_week)
                 model.Add(var2 != week).OnlyEnforceIf(is_in_this_week.Not())
-                c2_q4_choices.append(is_in_this_week)
-            model.AddBoolOr(c2_q4_choices).OnlyEnforceIf(is_c2_q4)
-            model.AddBoolAnd([choice.Not() for choice in c2_q4_choices]).OnlyEnforceIf(is_c2_q4.Not())
+                c2_last_term_choices.append(is_in_this_week)
+
+            model.AddBoolOr(c2_last_term_choices).OnlyEnforceIf(is_c2_q4)
+            model.AddBoolAnd([choice.Not() for choice in c2_last_term_choices]).OnlyEnforceIf(is_c2_q4.Not())
 
             # Either course in Q4 means reduced gap
-            either_in_q4 = model.NewBoolVar(f"{c1}_{c2}_either_in_q4")
-            model.AddBoolOr([is_c1_q4, is_c2_q4]).OnlyEnforceIf(either_in_q4)
-            model.AddBoolAnd([is_c1_q4.Not(), is_c2_q4.Not()]).OnlyEnforceIf(either_in_q4.Not())
+            either_in_last_term = model.NewBoolVar(f"{c1}_{c2}_either_in_last_term")
+            model.AddBoolOr([is_c1_q4, is_c2_q4]).OnlyEnforceIf(either_in_last_term)
+            model.AddBoolAnd([is_c1_q4.Not(), is_c2_q4.Not()]).OnlyEnforceIf(either_in_last_term.Not())
 
-            # Soft affinity constraint with reduced gap for Q4
+            # Soft affinity constraint with reduced gap for last term
             too_close = model.NewBoolVar(f"affinity_too_close_{c1}_{c2}_{run1}_{run2}")
 
-            # Regular gap weeks for non-Q4
+            # Regular gap weeks for non-last term
             far_enough_after_normal = model.NewBoolVar(f"far_after_{c1}_{c2}_{run1}_{run2}_normal")
             far_enough_before_normal = model.NewBoolVar(f"far_before_{c1}_{c2}_{run1}_{run2}_normal")
 
-            # Reduced gap weeks (50% reduction) for Q4
-            reduced_gap = max(1, gap_weeks // 2)  # Ensure minimum 1 week gap
-            far_enough_after_q4 = model.NewBoolVar(f"far_after_{c1}_{c2}_{run1}_{run2}_q4")
-            far_enough_before_q4 = model.NewBoolVar(f"far_before_{c1}_{c2}_{run1}_{run2}_q4")
+            # Reduced gap weeks for last term (Sep-Dec)
+            reduced_gap = max(1, gap_weeks - 1)  # Reduce by 1 week, minimum 1 week gap
+            far_enough_after_last_term = model.NewBoolVar(f"far_after_{c1}_{c2}_{run1}_{run2}_last_term")
+            far_enough_before_last_term = model.NewBoolVar(f"far_before_{c1}_{c2}_{run1}_{run2}_last_term")
 
             # Normal gap constraints
-            model.Add(var2 >= var1 + gap_weeks).OnlyEnforceIf([far_enough_after_normal, either_in_q4.Not()])
-            model.Add(var2 <= var1 - gap_weeks).OnlyEnforceIf([far_enough_before_normal, either_in_q4.Not()])
+            model.Add(var2 >= var1 + gap_weeks).OnlyEnforceIf([far_enough_after_normal, either_in_last_term.Not()])
+            model.Add(var2 <= var1 - gap_weeks).OnlyEnforceIf([far_enough_before_normal, either_in_last_term.Not()])
 
-            # Reduced gap constraints for Q4
-            model.Add(var2 >= var1 + reduced_gap).OnlyEnforceIf([far_enough_after_q4, either_in_q4])
-            model.Add(var2 <= var1 - reduced_gap).OnlyEnforceIf([far_enough_before_q4, either_in_q4])
+            # Reduced gap constraints for last term
+            model.Add(var2 >= var1 + reduced_gap).OnlyEnforceIf([far_enough_after_last_term, either_in_last_term])
+            model.Add(var2 <= var1 - reduced_gap).OnlyEnforceIf([far_enough_before_last_term, either_in_last_term])
 
-            # Combine normal and Q4 constraints
-            model.AddBoolOr([far_enough_after_normal, far_enough_before_normal]).OnlyEnforceIf([too_close.Not(), either_in_q4.Not()])
-            model.AddBoolOr([far_enough_after_q4, far_enough_before_q4]).OnlyEnforceIf([too_close.Not(), either_in_q4])
+            # Combine normal and last term constraints
+            model.AddBoolOr([far_enough_after_normal, far_enough_before_normal]).OnlyEnforceIf([too_close.Not(), either_in_last_term.Not()])
+            model.AddBoolOr([far_enough_after_last_term, far_enough_before_last_term]).OnlyEnforceIf([too_close.Not(), either_in_last_term])
 
             # Add violation constraints
-            model.Add(var2 < var1 + reduced_gap).OnlyEnforceIf([too_close, either_in_q4])
-            model.Add(var2 > var1 - reduced_gap).OnlyEnforceIf([too_close, either_in_q4])
-            model.Add(var2 < var1 + gap_weeks).OnlyEnforceIf([too_close, either_in_q4.Not()])
-            model.Add(var2 > var1 - gap_weeks).OnlyEnforceIf([too_close, either_in_q4.Not()])
+            model.Add(var2 < var1 + reduced_gap).OnlyEnforceIf([too_close, either_in_last_term])
+            model.Add(var2 > var1 - reduced_gap).OnlyEnforceIf([too_close, either_in_last_term])
+            model.Add(var2 < var1 + gap_weeks).OnlyEnforceIf([too_close, either_in_last_term.Not()])
+            model.Add(var2 > var1 - gap_weeks).OnlyEnforceIf([too_close, either_in_last_term.Not()])
 
             affinity_penalties.append(too_close)
-            print(f"  Added affinity constraint: {c1} and {c2} should be {gap_weeks} weeks apart (reduced to {reduced_gap} in Q4)")
+            print(f"  Added affinity constraint: {c1} and {c2} should be {gap_weeks} weeks apart (reduced to {reduced_gap} in last term Sep-Dec)")
 
         # Add champion assignments (soft)
         for (course, delivery_type, language, i), trainer_var in trainer_assignments.items():
@@ -1455,7 +1575,7 @@ class CourseScheduler:
             max_days = self.consultant_data.loc[self.consultant_data["Name"] == trainer, "Max_Days"].iloc[0]
 
             # Calculate total workload
-            total_workload = model.NewIntVar(0, max_days, f"total_workload_{trainer}")
+            total_workload = model.NewIntVar(0, max_days * 2, f"total_workload_{trainer}")  # Allow exceeding max but penalize
             weighted_sum = []
             for is_assigned, duration in workload_items:
                 weighted_sum.append((is_assigned, duration))
@@ -1468,32 +1588,55 @@ class CourseScheduler:
                     model.Add(term == 0).OnlyEnforceIf(is_assigned.Not())
                     weighted_terms.append(term)
                 model.Add(total_workload == sum(weighted_terms))
-                # Enforce maximum workload
-                model.Add(total_workload <= max_days)
+                
+                # Convert hard workload constraints to soft constraints
+                over_max = model.NewBoolVar(f"{trainer}_over_max")
+                model.Add(total_workload > max_days).OnlyEnforceIf(over_max)
+                model.Add(total_workload <= max_days).OnlyEnforceIf(over_max.Not())
+                workload_violation_penalties.append(over_max)
 
-                # For non-freelancers, encourage higher utilization
-                if not self.is_freelancer(trainer):
-                    # Calculate target utilization as a percentage of max days
-                    target_days = int(max_days * (70 / 100))  # 70% target
+                # Add minimum workload constraint for specific titles
+                if self.needs_minimum_workload(trainer):
+                    under_min = model.NewBoolVar(f"{trainer}_under_min")
+                    model.Add(total_workload < 140).OnlyEnforceIf(under_min)
+                    model.Add(total_workload >= 140).OnlyEnforceIf(under_min.Not())
+                    workload_violation_penalties.append(under_min)
 
-                    # Add penalty for underutilization
-                    under_target = model.NewBoolVar(f"{trainer}_under_target")
-                    model.Add(total_workload < target_days).OnlyEnforceIf(under_target)
-                    model.Add(total_workload >= target_days).OnlyEnforceIf(under_target.Not())
+        # Collect all penalties in a dictionary
+        penalties = {
+            "affinity": affinity_penalties,
+            "champion": champion_assignment_penalties,
+            "utilization": trainer_utilization_penalties,
+            "unscheduled": unscheduled_course_penalties,
+            "workload": workload_violation_penalties,
+            "spacing": spacing_violation_penalties,
+            "monthly": month_deviation_penalties
+        }
 
-                    # Higher priority trainers get stronger penalty
-                    priority = self.get_trainer_priority(trainer)
-                    penalty_weight = 7 - priority  # Invert priority (1 becomes 6, 6 becomes 1)
+        # Create weights dictionary from parameters
+        weights = {
+            "regular": {
+                "affinity": affinity_weight,
+                "champion": champion_weight,
+                "utilization": utilization_weight,
+                "monthly": monthly_weight
+            },
+            "prioritize_all": {
+                "unscheduled": 50,
+                "workload": 30,
+                "spacing": 20,
+                "monthly": monthly_weight,
+                "affinity": affinity_weight,
+                "champion": champion_weight,
+                "utilization": utilization_weight
+            }
+        }
 
-                    for _ in range(penalty_weight):
-                        trainer_utilization_penalties.append(under_target)
+        # Choose optimization mode
+        mode = "prioritize_all" if prioritize_all_courses else "regular"
 
-        # Objective function
-        model.Minimize(
-            2 * sum(affinity_penalties) +
-            4 * sum(champion_assignment_penalties) +
-            3 * sum(trainer_utilization_penalties)
-        )
+        # Create and add objective function
+        self._create_objective_function(model, penalties, mode, weights[mode])
 
         # Solve with final model
         solver = cp_model.CpSolver()
@@ -1976,30 +2119,36 @@ class CourseScheduler:
                 # Create dictionary to track trainer assignments by week
                 trainer_assignments_by_week = {}
                 champion_assignments_by_week = {}
+                course_assignments_by_week = {}  # New dictionary to track course names
                 
                 # Process schedule data to get assignments
                 for _, row in schedule_df.iterrows():
                     week = row['Week']
                     trainer = row['Trainer']
+                    course = row['Course']  # Get course name
                     is_champion = row['Champion'].strip() == "✓"
                     
                     if (trainer, week) not in trainer_assignments_by_week:
                         trainer_assignments_by_week[(trainer, week)] = 0
+                        course_assignments_by_week[(trainer, week)] = course  # Store course name
                     
                     trainer_assignments_by_week[(trainer, week)] += 1
                     
                     if is_champion:
                         if (trainer, week) not in champion_assignments_by_week:
                             champion_assignments_by_week[(trainer, week)] = 0
-                        
                         champion_assignments_by_week[(trainer, week)] += 1
+                
+                # Increase column width for course names
+                for col_idx in range(2, len(self.weekly_calendar) + 2):
+                    worksheet.column_dimensions[get_column_letter(col_idx)].width = 20
                 
                 # Process all trainers and weeks
                 for row_idx, trainer in enumerate(trainers, start=2):
                     for col_idx, week_start_date in enumerate(self.weekly_calendar, start=2):
                         week_num = col_idx - 1  # Adjusted for Excel column indexing
                         cell = worksheet.cell(row=row_idx, column=col_idx)
-                        cell.alignment = Alignment(horizontal='center', vertical='center')
+                        cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
                         
                         # Check for public holidays
                         has_public_holiday = False
@@ -2021,7 +2170,7 @@ class CourseScheduler:
                         is_assigned = (trainer, week_num) in trainer_assignments_by_week
                         is_champion_assignment = (trainer, week_num) in champion_assignments_by_week
                         
-                        # Apply appropriate fill and set value
+                        # Apply appropriate fill and set course name
                         if is_on_vacation:
                             cell.fill = red_fill
                             cell.value = "Vacation"
@@ -2030,12 +2179,11 @@ class CourseScheduler:
                             cell.value = "Holiday"
                         elif is_champion_assignment:
                             cell.fill = dark_green_fill
-                            cell.value = "Champion"
-                            # White text for dark background
-                            cell.font = Font(color="FFFFFF")
+                            cell.value = course_assignments_by_week.get((trainer, week_num), "")
+                            cell.font = Font(color="FFFFFF")  # White text for dark background
                         elif is_assigned:
                             cell.fill = light_green_fill
-                            cell.value = "Assigned"
+                            cell.value = course_assignments_by_week.get((trainer, week_num), "")
                         else:
                             cell.value = ""
                 
@@ -2702,14 +2850,7 @@ def main():
                         value=70,
                         help="Target percentage of max workdays for trainers"
                     )
-                    # Add a slider to limit affinity constraints
-                    max_affinity = st.slider(
-                        "Maximum Affinity Constraints",
-                        min_value=10,
-                        max_value=200,
-                        value=50,
-                        help="Limit the number of course affinity constraints to reduce memory usage"
-                    )
+                    # Remove the max_affinity_constraints slider since we're using all affinity pairs
                     st.markdown('</div>', unsafe_allow_html=True)
 
                 with col2:
@@ -2818,9 +2959,7 @@ def main():
                                     min_course_spacing=min_course_spacing,
                                     solution_strategy=solution_strategy,
                                     enforce_monthly_distribution=enforce_monthly,
-                                    max_affinity_constraints=max_affinity,
                                     prioritize_all_courses=prioritize_all_courses,
-                                    accelerated_mode=accelerated_mode,
                                     progress_callback=update_progress  # Pass the progress callback
                                 )
 
@@ -2900,7 +3039,7 @@ def main():
                                         solution_strategy="FIND_FEASIBLE_FAST",
                                         enforce_monthly_distribution=False,
                                         prioritize_all_courses=False,
-                                        accelerated_mode=True
+                                        progress_callback=None
                                     )
 
                                     if status not in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
@@ -2921,7 +3060,7 @@ def main():
                                         solution_strategy="FIND_FEASIBLE_FAST",
                                         enforce_monthly_distribution=False,
                                         prioritize_all_courses=False,
-                                        accelerated_mode=True
+                                        progress_callback=None
                                     )
 
                                 # Rest of the visualization code stays the same...

@@ -1,0 +1,305 @@
+import pandas as pd
+import datetime
+import streamlit as st
+st.set_page_config(page_title="Course Scheduler", layout="wide")
+import matplotlib.pyplot as plt
+from ortools.sat.python import cp_model
+import logging
+from openpyxl import Workbook
+from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+from openpyxl.drawing.image import Image
+import threading
+import time
+import os
+
+# Set up logging at the beginning of your app.py
+logging.basicConfig(level=logging.ERROR)
+
+
+# Import template generator
+from template_generator import create_excel_template
+
+class CourseScheduler:
+    def __init__(self):
+        self.course_run_data = None
+        self.consultant_data = None
+        self.priority_data = None
+        self.annual_leaves = None
+        self.affinity_matrix_data = None
+        self.public_holidays_data = None
+        self.weekly_calendar = None
+        self.week_to_month_map = {}
+        self.weekly_working_days = {}
+        self.fleximatrix = {}  # Dictionary mapping (course, language) to list of qualified trainers
+        self.course_champions = {}  # Dictionary to store champions for each course
+
+    def load_data_from_excel(self, uploaded_file):
+        """Load all required data from an Excel file with multiple sheets"""
+        try:
+            # Read the Excel file with multiple sheets
+            excel_file = pd.ExcelFile(uploaded_file)
+
+            # Load each required sheet
+            self.course_run_data = pd.read_excel(excel_file, sheet_name='CourseData')
+            self.consultant_data = pd.read_excel(excel_file, sheet_name='TrainerData')
+            self.priority_data = pd.read_excel(excel_file, sheet_name='PriorityData')
+            self.annual_leaves = pd.read_excel(excel_file, sheet_name='AnnualLeaves')
+            self.affinity_matrix_data = pd.read_excel(excel_file, sheet_name='AffinityMatrix')
+            self.public_holidays_data = pd.read_excel(excel_file, sheet_name='PublicHolidays')
+
+            # Parse date columns
+            date_columns = ['Start_Date', 'End_Date']
+            for col in date_columns:
+                if col in self.annual_leaves.columns:
+                    self.annual_leaves[col] = pd.to_datetime(self.annual_leaves[col]).dt.date
+
+            if 'Start Date' in self.public_holidays_data.columns:
+                self.public_holidays_data['Start Date'] = pd.to_datetime(
+                    self.public_holidays_data['Start Date']).dt.date
+
+            if 'End Date' in self.public_holidays_data.columns:
+                self.public_holidays_data['End Date'] = pd.to_datetime(self.public_holidays_data['End Date']).dt.date
+
+            # Load fleximatrix - which trainers can teach which courses (wide format)
+            flexi_sheet = pd.read_excel(excel_file, sheet_name='Fleximatrix')
+
+            # Process the wide-format Fleximatrix
+            self.fleximatrix, self.course_champions = self.process_wide_fleximatrix(flexi_sheet)
+
+            # Load adjusted monthly demand data
+            self.monthly_demand = pd.read_excel(excel_file, sheet_name='MonthlyDemand')
+
+            # Load course week restrictions (if exists)
+            self.week_restrictions = {}
+            try:
+                # Check if the sheet exists
+                restrictions_sheet = pd.read_excel(excel_file, sheet_name='WeekRestrictions')
+
+                # Process each restriction
+                for _, row in restrictions_sheet.iterrows():
+                    course = row['Course']
+                    week_type = row['Week Type']  # 'First', 'Second', 'Third', 'Fourth', 'Last'
+                    restricted = row['Restricted']  # Boolean: True = cannot run, False = can run
+
+                    if course not in self.week_restrictions:
+                        self.week_restrictions[course] = {}
+
+                    self.week_restrictions[course][week_type] = restricted
+
+                print(f"Loaded {len(restrictions_sheet)} week restrictions for courses")
+            except Exception as e:
+                print(f"No week restrictions found or error loading them: {e}")
+                self.week_restrictions = {}
+
+            return True
+
+        except Exception as e:
+            st.error(f"Error loading data: {e}")
+            return False
+
+    def process_wide_fleximatrix(self, flexi_sheet):
+        """Process a wide-format Fleximatrix where consultants are columns"""
+        fleximatrix = {}
+        course_champions = {}
+
+        # Get list of consultants (all columns except CourseName, CategoryName, Language, and Champion)
+        consultants = [col for col in flexi_sheet.columns
+                       if col not in ['CourseName', 'CategoryName', 'Language', 'Champion']]
+
+        # Process each row (course+language combination)
+        for _, row in flexi_sheet.iterrows():
+            course = row['CourseName']
+            language = row['Language']
+            champion = row['Champion']
+
+            # Initialize empty list for this course+language
+            fleximatrix[(course, language)] = []
+
+            # Add the champion
+            if champion and str(champion).strip():
+                course_champions[(course, language)] = champion
+
+            # Add all qualified consultants (marked with "U")
+            for consultant in consultants:
+                if row[consultant] == "U":
+                    fleximatrix[(course, language)].append(consultant)
+
+        return fleximatrix, course_champions
+
+
+    def initialize_calendar(self, year, weekend_selection):
+        """Initialize the weekly calendar based on year and weekend selection"""
+
+        # Function to Generate Work Week Start Dates
+        def get_week_start_dates(year, weekend_selection):
+            first_day = datetime.date(year, 1, 1)
+            if weekend_selection == "FS":  # Friday-Saturday
+                week_start = 6  # Sunday
+            else:  # "Saturday-Sunday"
+                week_start = 0  # Monday
+
+            weeks = []
+            current_date = first_day
+
+            # Find the first day that matches our week start
+            while current_date.weekday() != week_start:
+                current_date += datetime.timedelta(days=1)
+
+            # Generate all week start dates for the year
+            while current_date.year == year:
+                weeks.append(current_date)
+                current_date += datetime.timedelta(days=7)  # Move to next week
+
+            return weeks
+
+        # Generate Work Week Start Dates
+        self.weekly_calendar = get_week_start_dates(year, weekend_selection)
+
+        # Ensure correct mapping of weeks to months
+        self.week_to_month_map = {}
+        self.week_position_in_month = {}  # Track position of week within its month
+
+        # First, map weeks to months
+        for i, week_start in enumerate(self.weekly_calendar):
+            month = week_start.month  # Extract the month from the start date
+            self.week_to_month_map[i + 1] = month  # Map week number to month
+
+        # Then, calculate position of each week within its month
+        for week_num, month in self.week_to_month_map.items():
+            # Get all weeks in this month
+            month_weeks = [w for w, m in self.week_to_month_map.items() if m == month]
+            month_weeks.sort()
+
+            # Find position (1-indexed)
+            position = month_weeks.index(week_num) + 1
+
+            # Also mark if it's the last week of the month
+            is_last = (position == len(month_weeks))
+
+            # Store as a dictionary with position info
+            self.week_position_in_month[week_num] = {
+                'position': position,
+                'total_weeks': len(month_weeks),
+                'is_first': (position == 1),
+                'is_second': (position == 2),
+                'is_third': (position == 3),
+                'is_fourth': (position == 4),
+                'is_last': is_last
+            }
+
+        # Calculate working days for each week accounting for public holidays
+        self.weekly_working_days = {}
+        
+        # If no public holidays data, assume 5 working days per week
+        if self.public_holidays_data is None or len(self.public_holidays_data) == 0:
+            for i in range(len(self.weekly_calendar)):
+                self.weekly_working_days[i + 1] = 5
+            return True
+            
+        # Calculate working days with holidays
+        self.calculate_working_days()
+
+        return True
+
+
+    def calculate_working_days(self):
+        """Calculate working days for each week accounting for public holidays"""
+        self.weekly_working_days = {}
+
+        # Handle case when public_holidays_data is None or empty
+        if self.public_holidays_data is None or len(self.public_holidays_data) == 0:
+            # If no holidays data, assume all weeks have 5 working days
+            for i, _ in enumerate(self.weekly_calendar):
+                week_num = i + 1
+                self.weekly_working_days[week_num] = 5
+            return
+
+        for i, week_start in enumerate(self.weekly_calendar):
+            week_num = i + 1
+            working_days = 5  # Assume a full workweek
+
+            # Check if this week is completely inside a long holiday
+            fully_inside_long_holiday = False
+
+            for _, row in self.public_holidays_data.iterrows():
+                holiday_length = (row["End Date"] - row["Start Date"]).days + 1
+
+                # If it's a long holiday (25+ days) and the week is fully inside it
+                if holiday_length >= 25:
+                    if week_start >= row["Start Date"] and (week_start + datetime.timedelta(days=4)) <= row["End Date"]:
+                        fully_inside_long_holiday = True
+                        break
+
+            # If fully inside a long holiday, block the week completely
+            if fully_inside_long_holiday:
+                working_days = 0
+            else:
+                # Adjust only affected days for regular holidays
+                for _, row in self.public_holidays_data.iterrows():
+                    holiday_days_in_week = sum(
+                        1 for d in range(5)  # Check only workdays
+                        if row["Start Date"] <= (week_start + datetime.timedelta(days=d)) <= row["End Date"]
+                        and (week_start + datetime.timedelta(days=d)).weekday() not in [5, 6]  # Exclude weekends
+                    )
+                    working_days -= holiday_days_in_week
+                    working_days = max(0, working_days)  # Ensure no negative values
+
+            self.weekly_working_days[week_num] = working_days
+
+
+    def is_trainer_available(self, trainer_name, week_num):
+        """Check if trainer is available during the given week (not on leave)"""
+        week_start = self.weekly_calendar[week_num - 1]
+        week_end = week_start + datetime.timedelta(days=4)  # Assuming 5-day courses
+
+        # Handle case where annual_leaves is None
+        if self.annual_leaves is None or len(self.annual_leaves) == 0:
+            return True
+            
+        # Determine the correct column name for trainer
+        trainer_column = None
+        if 'Trainer' in self.annual_leaves.columns:
+            trainer_column = 'Trainer'
+        elif 'Name' in self.annual_leaves.columns:
+            trainer_column = 'Name'
+        else:
+            # No relevant column found, assume trainer is available
+            return True
+            
+        # Check against all leave periods
+        trainer_leaves = self.annual_leaves[self.annual_leaves[trainer_column] == trainer_name]
+        for _, leave in trainer_leaves.iterrows():
+            # If leave period overlaps with course week, trainer is unavailable
+            if (leave["Start_Date"] <= week_end and leave["End_Date"] >= week_start):
+                return False
+        return True
+
+
+    def get_trainer_priority(self, trainer_name):
+        """Get priority level for a trainer based on their title"""
+        # Handle case where priority_data or consultant_data is None
+        if self.priority_data is None or self.consultant_data is None:
+            return 1  # Default priority
+            
+        # Get trainer title
+        title_series = self.consultant_data.loc[self.consultant_data["Name"] == trainer_name, "Title"]
+        if len(title_series) == 0:
+            return 1  # Default priority if trainer not found
+        
+        title = title_series.iloc[0]
+        
+        # Look up priority based on title
+        priority_series = self.priority_data.loc[self.priority_data["Title"] == title, "Priority"]
+        if len(priority_series) == 0:
+            return 1  # Default priority if title not found
+            
+        return priority_series.iloc[0]
+
+
+    def is_freelancer(self, trainer_name):
+        """Check if a trainer is a freelancer"""
+        # Handle case where consultant_data is None
+        if self.consultant_data is None:
+            return False
+            
