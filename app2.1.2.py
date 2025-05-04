@@ -1781,6 +1781,8 @@ class CourseScheduler:
 
         for (course, delivery_type, language, i), week_var in schedule.items():
             assigned_week = solver.Value(week_var)
+            if assigned_week == 0:
+                continue  # Skip unscheduled runs
             month = self.week_to_month_map[assigned_week]
             monthly_counts[month] += 1
 
