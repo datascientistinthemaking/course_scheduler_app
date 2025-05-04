@@ -734,6 +734,32 @@ class CourseScheduler:
             model.Add(total_workload <= max_days).OnlyEnforceIf(above_max.Not())
             workload_violation_penalties.extend([above_max] * above_max_weight)
 
+        # CONSTRAINT: Trainer can only teach one course per week
+        print("Adding constraint: trainer can only teach one course per week")
+        for trainer in self.consultant_data["Name"]:
+            for week in range(1, max_weeks + 1):
+                assignments = []
+                for (course, delivery_type, language, i), week_var in schedule.items():
+                    if (course, delivery_type, language, i) not in trainer_assignments:
+                        continue
+                    qualified_trainers = self.fleximatrix.get((course, language), [])
+                    if trainer not in qualified_trainers:
+                        continue
+                    t_idx = qualified_trainers.index(trainer)
+                    trainer_var = trainer_assignments[(course, delivery_type, language, i)]
+                    is_this_week = model.NewBoolVar(f"{course}_{i}_{trainer}_in_week_{week}")
+                    model.Add(week_var == week).OnlyEnforceIf(is_this_week)
+                    model.Add(week_var != week).OnlyEnforceIf(is_this_week.Not())
+                    is_this_trainer = model.NewBoolVar(f"{course}_{i}_{trainer}_assigned")
+                    model.Add(trainer_var == t_idx).OnlyEnforceIf(is_this_trainer)
+                    model.Add(trainer_var != t_idx).OnlyEnforceIf(is_this_trainer.Not())
+                    is_assigned = model.NewBoolVar(f"{course}_{i}_{trainer}_assigned_in_week_{week}")
+                    model.AddBoolAnd([is_this_week, is_this_trainer]).OnlyEnforceIf(is_assigned)
+                    model.AddBoolOr([is_this_week.Not(), is_this_trainer.Not()]).OnlyEnforceIf(is_assigned.Not())
+                    assignments.append(is_assigned)
+                if assignments:
+                    model.Add(sum(assignments) <= 1)
+
         # After the trainer workload constraints but before the objective function
         # CONSTRAINT 4: Course affinities
         print("Adding affinity constraints for course pairs...")
