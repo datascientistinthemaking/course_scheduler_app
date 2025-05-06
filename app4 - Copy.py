@@ -33,22 +33,6 @@ class CourseScheduler:
         self.weekly_working_days = {}
         self.fleximatrix = {}  # Dictionary mapping (course, language) to list of qualified trainers
         self.course_champions = {}  # Dictionary to store champions for each course
-        self.weights = None  # Store optimization weights
-        # New: week_restrictions will be a dict mapping course name to a list of blocked week numbers
-        # This will be loaded from a matrix-style Excel template where each week start date is a column
-        # and each cell is marked (e.g., 'X', 1, or TRUE) if the course is blocked for that week.
-
-        """
-        Excel Template Format (Blocked Weeks):
-        - Sheet name: BlockedWeeks
-        - Columns: 'Course Name', then one column for each week start date (YYYY-MM-DD)
-        - For each course, mark an 'X', 1, or TRUE in the cell for any week that course should be blocked from running.
-        - Example:
-            | Course Name         | 2025-01-05 | 2025-01-12 | ... |
-            |---------------------|------------|------------|-----|
-            | Advanced Finance    | X          |            | ... |
-            | Project Management  |            | X          | ... |
-        """
 
     def _sample_courses_for_optimization(self, course_data, max_courses=500):
         """
@@ -145,53 +129,27 @@ class CourseScheduler:
             # Load adjusted monthly demand data
             self.monthly_demand = pd.read_excel(excel_file, sheet_name='MonthlyDemand')
 
-            # --- NEW BLOCKED WEEKS LOGIC ---
+            # Load course week restrictions (if exists)
             self.week_restrictions = {}
             try:
-                blocked_weeks_df = pd.read_excel(excel_file, sheet_name='BlockedWeeks')
-                # Get expected week columns from the calendar (must be initialized first)
-                if not hasattr(self, 'weekly_calendar') or self.weekly_calendar is None:
-                    raise ValueError("Calendar must be initialized before loading blocked weeks.")
-                expected_week_cols = [dt.strftime("%Y-%m-%d") for dt in self.weekly_calendar]
-                uploaded_week_cols = [col for col in blocked_weeks_df.columns if col != "Course Name"]
-                missing = set(expected_week_cols) - set(uploaded_week_cols)
-                extra = set(uploaded_week_cols) - set(expected_week_cols)
-                if missing or extra:
-                    msg = "BlockedWeeks sheet does not match the current calendar year.\n"
-                    if missing:
-                        msg += f"Missing columns: {sorted(missing)}\n"
-                    if extra:
-                        msg += f"Unexpected columns: {sorted(extra)}\n"
-                    msg += "Please regenerate the template after initializing the calendar for the correct year."
-                    raise ValueError(msg)
-                # Map date strings to week numbers
-                date_to_week = {dt.strftime("%Y-%m-%d"): i+1 for i, dt in enumerate(self.weekly_calendar)}
-                for _, row in blocked_weeks_df.iterrows():
-                    course = row["Course Name"]
-                    blocked = []
-                    for col in expected_week_cols:
-                        val = str(row[col]).strip().upper()
-                        if val in ["X", "1", "TRUE"]:
-                            blocked.append(date_to_week[col])
-                    if blocked:
-                        self.week_restrictions[course] = blocked
-            except Exception as e:
-                print(f"No BlockedWeeks sheet found or error loading it: {e}")
-                self.week_restrictions = {}
-
-            # Load course week restrictions (legacy, now ignored)
-            self.week_restrictions_legacy = {}
-            try:
+                # Check if the sheet exists
                 restrictions_sheet = pd.read_excel(excel_file, sheet_name='WeekRestrictions')
+
+                # Process each restriction
                 for _, row in restrictions_sheet.iterrows():
                     course = row['Course']
-                    week_type = row['Week Type']
-                    restricted = row['Restricted']
-                    if course not in self.week_restrictions_legacy:
-                        self.week_restrictions_legacy[course] = {}
-                    self.week_restrictions_legacy[course][week_type] = restricted
+                    week_type = row['Week Type']  # 'First', 'Second', 'Third', 'Fourth', 'Last'
+                    restricted = row['Restricted']  # Boolean: True = cannot run, False = can run
+
+                    if course not in self.week_restrictions:
+                        self.week_restrictions[course] = {}
+
+                    self.week_restrictions[course][week_type] = restricted
+
+                print(f"Loaded {len(restrictions_sheet)} week restrictions for courses")
             except Exception as e:
-                pass  # Ignore legacy
+                print(f"No week restrictions found or error loading them: {e}")
+                self.week_restrictions = {}
 
             return True
 
@@ -358,111 +316,98 @@ class CourseScheduler:
         return title == "Freelancer"
 
     def _create_objective_function(self, model, penalties, mode="regular", weights=None):
-        """Create the objective function with normalized penalties."""
-        # Calculate normalization factors
-        total_courses = sum(self.course_run_data["Runs"])
-        total_required_gaps = sum(row["Gap Weeks"] for _, row in self.affinity_matrix_data.iterrows())
-        total_course_days = sum(self.course_run_data["Runs"] * self.course_run_data["Duration"])
-        
-        # Ensure no division by zero
-        total_courses = max(1, total_courses)
-        total_required_gaps = max(1, total_required_gaps)
-        total_course_days = max(1, total_course_days)
+        """Create the objective function based on the specified mode and weights."""
+        default_weights = {
+            "regular": {
+                "affinity": 2,
+                "priority": 4,
+                "monthly": 5,
+                "workload": 40  # High weight for workload violations
+            },
+            "prioritize_all": {
+                "unscheduled": 50,
+                "workload": 30,
+                "spacing": 20,
+                "monthly": 5,
+                "affinity": 2,
+                "priority": 4
+            }
+        }
 
-        # Create scaled variables for each type of violation
-        scaled_penalties = {}
+        # Use provided weights or defaults
+        active_weights = weights or default_weights[mode]
 
-        # 1. Monthly Distribution Penalties
-        if penalties.get("monthly"):
-            monthly_sum = model.NewIntVar(0, total_courses, "monthly_sum")
-            model.Add(monthly_sum == sum(penalties["monthly"]))
-            monthly_scaled = model.NewIntVar(0, 100, "monthly_scaled")
-            model.Add(monthly_scaled == monthly_sum * 100 / total_courses)
-            scaled_penalties["monthly"] = monthly_scaled
+        # Create weighted sums for each penalty type
+        objective_terms = []
 
-        # 2. Affinity Rule Penalties
-        if penalties.get("affinity"):
-            affinity_sum = model.NewIntVar(0, total_required_gaps, "affinity_sum")
-            model.Add(affinity_sum == sum(penalties["affinity"]))
-            affinity_scaled = model.NewIntVar(0, 100, "affinity_scaled")
-            model.Add(affinity_scaled == affinity_sum * 100 / total_required_gaps)
-            scaled_penalties["affinity"] = affinity_scaled
-
-        # 3. Workload Penalties
-        if penalties.get("workload"):
-            workload_sum = model.NewIntVar(0, total_course_days, "workload_sum")
-            model.Add(workload_sum == sum(penalties["workload"]))
-            workload_scaled = model.NewIntVar(0, 100, "workload_scaled")
-            model.Add(workload_scaled == workload_sum * 100 / total_course_days)
-            scaled_penalties["workload"] = workload_scaled
-
-        # Create weighted objective based on mode
         if mode == "regular":
-            # Calculate weighted components
-            monthly_contrib = model.NewIntVar(0, weights["monthly"], "monthly_contrib")
-            affinity_contrib = model.NewIntVar(0, weights["affinity"], "affinity_contrib")
-            workload_contrib = model.NewIntVar(0, weights["workload"], "workload_contrib")
-            
-            # Set each contribution
-            if "monthly" in scaled_penalties:
-                model.Add(monthly_contrib == scaled_penalties["monthly"] * weights["monthly"] / 100)
-            else:
-                model.Add(monthly_contrib == 0)
-                
-            if "affinity" in scaled_penalties:
-                model.Add(affinity_contrib == scaled_penalties["affinity"] * weights["affinity"] / 100)
-            else:
-                model.Add(affinity_contrib == 0)
-                
-            if "workload" in scaled_penalties:
-                model.Add(workload_contrib == scaled_penalties["workload"] * weights["workload"] / 100)
-            else:
-                model.Add(workload_contrib == 0)
+            if "workload" in penalties and penalties["workload"]:
+                objective_terms.extend([active_weights["workload"]] * len(penalties["workload"]))
+            if "affinity" in penalties and penalties["affinity"]:
+                objective_terms.extend([active_weights["affinity"]] * len(penalties["affinity"]))
+            if "priority" in penalties and penalties["priority"]:
+                objective_terms.extend([active_weights["priority"]] * len(penalties["priority"]))
+            if "monthly" in penalties and penalties["monthly"]:
+                objective_terms.extend([active_weights["monthly"]] * len(penalties["monthly"]))
 
-            # Sum up all contributions
-            objective = model.NewIntVar(0, sum(weights.values()), "objective")
-            model.Add(objective == monthly_contrib + affinity_contrib + workload_contrib)
-            
-            return model.Minimize(objective)
+            # Combine all penalties into a single list
+            all_penalties = []
+            all_penalties.extend(penalties.get("workload", []))
+            all_penalties.extend(penalties.get("affinity", []))
+            all_penalties.extend(penalties.get("priority", []))
+            all_penalties.extend(penalties.get("monthly", []))
+
+            if not all_penalties:
+                return model.Minimize(0)  # No penalties to minimize
+
+            return model.Minimize(sum(w * p for w, p in zip(objective_terms, all_penalties)))
 
         elif mode == "prioritize_all":
-            # Calculate weighted components
-            monthly_contrib = model.NewIntVar(0, weights["monthly"], "monthly_contrib")
-            affinity_contrib = model.NewIntVar(0, weights["affinity"], "affinity_contrib")
-            workload_contrib = model.NewIntVar(0, weights["workload"], "workload_contrib")
-            unscheduled_contrib = model.NewIntVar(0, weights["unscheduled"], "unscheduled_contrib")
-            
-            # Set each contribution
-            if "monthly" in scaled_penalties:
-                model.Add(monthly_contrib == scaled_penalties["monthly"] * weights["monthly"] / 100)
-            else:
-                model.Add(monthly_contrib == 0)
-                
-            if "affinity" in scaled_penalties:
-                model.Add(affinity_contrib == scaled_penalties["affinity"] * weights["affinity"] / 100)
-            else:
-                model.Add(affinity_contrib == 0)
-                
-            if "workload" in scaled_penalties:
-                model.Add(workload_contrib == scaled_penalties["workload"] * weights["workload"] / 100)
-            else:
-                model.Add(workload_contrib == 0)
-                
-            if "unscheduled" in penalties:
-                unscheduled_sum = model.NewIntVar(0, total_courses, "unscheduled_sum")
-                model.Add(unscheduled_sum == sum(penalties["unscheduled"]))
-                unscheduled_scaled = model.NewIntVar(0, 100, "unscheduled_scaled")
-                model.Add(unscheduled_scaled == unscheduled_sum * 100 / total_courses)
-                model.Add(unscheduled_contrib == unscheduled_scaled * weights["unscheduled"] / 100)
-            else:
-                model.Add(unscheduled_contrib == 0)
+            if "unscheduled" in penalties and penalties["unscheduled"]:
+                objective_terms.extend([active_weights["unscheduled"]] * len(penalties["unscheduled"]))
+            if "workload" in penalties and penalties["workload"]:
+                objective_terms.extend([active_weights["workload"]] * len(penalties["workload"]))
+            if "spacing" in penalties and penalties["spacing"]:
+                objective_terms.extend([active_weights["spacing"]] * len(penalties["spacing"]))
+            if "monthly" in penalties and penalties["monthly"]:
+                objective_terms.extend([active_weights["monthly"]] * len(penalties["monthly"]))
+            if "affinity" in penalties and penalties["affinity"]:
+                objective_terms.extend([active_weights["affinity"]] * len(penalties["affinity"]))
+            if "priority" in penalties and penalties["priority"]:
+                objective_terms.extend([active_weights["priority"]] * len(penalties["priority"]))
 
-            # Sum up all contributions
-            objective = model.NewIntVar(0, sum(weights.values()), "objective")
-            model.Add(objective == monthly_contrib + affinity_contrib + workload_contrib + unscheduled_contrib)
-            
-            return model.Minimize(objective)
+            # Combine all penalties into a single list
+            all_penalties = []
+            all_penalties.extend(penalties.get("unscheduled", []))
+            all_penalties.extend(penalties.get("workload", []))
+            all_penalties.extend(penalties.get("spacing", []))
+            all_penalties.extend(penalties.get("monthly", []))
+            all_penalties.extend(penalties.get("affinity", []))
+            all_penalties.extend(penalties.get("priority", []))
 
+            if not all_penalties:
+                return model.Minimize(0)  # No penalties to minimize
+
+            return model.Minimize(sum(w * p for w, p in zip(objective_terms, all_penalties)))
+
+        elif mode == "incremental":
+            if "workload" in penalties and penalties["workload"]:
+                objective_terms.extend([40] * len(penalties["workload"]))
+            if "affinity" in penalties and penalties["affinity"]:
+                objective_terms.extend([2] * len(penalties["affinity"]))
+            if "priority" in penalties and penalties["priority"]:
+                objective_terms.extend([4] * len(penalties["priority"]))
+
+            # Combine all penalties into a single list
+            all_penalties = []
+            all_penalties.extend(penalties.get("workload", []))
+            all_penalties.extend(penalties.get("affinity", []))
+            all_penalties.extend(penalties.get("priority", []))
+
+            if not all_penalties:
+                return model.Minimize(0)  # No penalties to minimize
+
+            return model.Minimize(sum(w * p for w, p in zip(objective_terms, all_penalties)))
         else:
             raise ValueError(f"Unknown optimization mode: {mode}")
 
@@ -472,26 +417,7 @@ class CourseScheduler:
                          solution_strategy="BALANCED",
                          enforce_monthly_distribution=False,
                          prioritize_all_courses=False,
-                         progress_callback=None,
-                         random_seed=42,
-                         workload_violation_weight=30):
-        """
-        Run the course scheduling optimization.
-        Set random_seed for reproducibility of results.
-        Set workload_violation_weight to control penalty for trainer workload violations.
-        """
-        print(f"DEBUG: workload_violation_weight = {workload_violation_weight}")
-        # Create weights dictionary
-        weights = {
-            "monthly": monthly_weight,
-            "affinity": affinity_weight,
-            "workload": workload_violation_weight,  # Store the workload weight
-            "unscheduled": 50 if prioritize_all_courses else 0,
-            "spacing": 20 if prioritize_all_courses else 0
-        }
-
-        # Store weights for later use
-        self.weights = weights
+                         progress_callback=None):
 
         # Helper function to log and update progress
         def log_progress(message, percent=None):
@@ -620,11 +546,6 @@ class CourseScheduler:
                                     valid_weeks.append(w)
                                     break
 
-                    # Enforce blocked weeks (new logic)
-                    if course in self.week_restrictions:
-                        for blocked_week in self.week_restrictions[course]:
-                            model.Add(start_week != blocked_week)
-
                     if valid_weeks:
                         # Convert hard constraint to soft constraint
                         for w in range(1, max_weeks + 1):
@@ -641,39 +562,6 @@ class CourseScheduler:
             except Exception as e:
                 print(f"Error processing course {course}: {e}")
                 continue
-
-        # --- NEW HARD CONSTRAINT: For courses with 7+ runs, at least one run in each Q4 month ---
-        q4_months = [10, 11, 12]
-        # Calculate total runs per course (across all languages)
-        course_total_runs = {}
-        course_run_vars = {}
-        for (course, delivery_type, language, i), week_var in schedule.items():
-            if course not in course_total_runs:
-                course_total_runs[course] = 0
-                course_run_vars[course] = []
-            course_total_runs[course] += 1
-            course_run_vars[course].append(week_var)
-
-        for course, total_runs in course_total_runs.items():
-            if total_runs >= 7:
-                for month in q4_months:
-                    # Get all weeks in this month
-                    month_weeks = [week for week, m in self.week_to_month_map.items() if m == month]
-                    in_month_vars = []
-                    for week_var in course_run_vars[course]:
-                        is_in_month = model.NewBoolVar(f"{course}_run_in_month_{month}")
-                        week_choices = []
-                        for w in month_weeks:
-                            is_this_week = model.NewBoolVar(f"{course}_run_{week_var}_is_week_{w}")
-                            model.Add(week_var == w).OnlyEnforceIf(is_this_week)
-                            model.Add(week_var != w).OnlyEnforceIf(is_this_week.Not())
-                            week_choices.append(is_this_week)
-                        model.AddBoolOr(week_choices).OnlyEnforceIf(is_in_month)
-                        model.AddBoolAnd([choice.Not() for choice in week_choices]).OnlyEnforceIf(is_in_month.Not())
-                        in_month_vars.append(is_in_month)
-                    # Hard constraint: at least one run in this month
-                    model.Add(sum(in_month_vars) >= 1)
-        # --- END NEW HARD CONSTRAINT ---
 
         log_progress("Adding monthly distribution constraints...", 0.30)
         # CONSTRAINT 1: Track which month each course is assigned to and enforce monthly distribution
@@ -975,48 +863,50 @@ class CourseScheduler:
             model.AddBoolOr([is_c1_q4, is_c2_q4]).OnlyEnforceIf(either_in_last_term)
             model.AddBoolAnd([is_c1_q4.Not(), is_c2_q4.Not()]).OnlyEnforceIf(either_in_last_term.Not())
 
-            # Calculate reduced gap for last term
+            # Soft affinity constraint with reduced gap for last term
+            too_close = model.NewBoolVar(f"affinity_too_close_{c1}_{c2}_{run1}_{run2}")
+
+            # Regular gap weeks for non-last term
+            far_enough_after_normal = model.NewBoolVar(f"far_after_{c1}_{c2}_{run1}_{run2}_normal")
+            far_enough_before_normal = model.NewBoolVar(f"far_before_{c1}_{c2}_{run1}_{run2}_normal")
+
+            # Reduced gap weeks for last term (Sep-Dec)
             reduced_gap = max(1, gap_weeks - 1)  # Reduce by 1 week, minimum 1 week gap
+            far_enough_after_last_term = model.NewBoolVar(f"far_after_{c1}_{c2}_{run1}_{run2}_last_term")
+            far_enough_before_last_term = model.NewBoolVar(f"far_before_{c1}_{c2}_{run1}_{run2}_last_term")
 
-            # Variables to track the actual gap
-            actual_gap = model.NewIntVar(0, max_weeks, f"actual_gap_{c1}_{c2}_{run1}_{run2}")
-            gap_violation = model.NewIntVar(0, max_weeks, f"gap_violation_{c1}_{c2}_{run1}_{run2}")
+            # Normal gap constraints
+            model.Add(var2 >= var1 + gap_weeks).OnlyEnforceIf([far_enough_after_normal, either_in_last_term.Not()])
+            model.Add(var2 <= var1 - gap_weeks).OnlyEnforceIf([far_enough_before_normal, either_in_last_term.Not()])
 
-            # Calculate actual gap (absolute value of difference between weeks)
-            week_diff = model.NewIntVar(-max_weeks, max_weeks, f"week_diff_{c1}_{c2}_{run1}_{run2}")
-            model.Add(week_diff == var2 - var1)
+            # Reduced gap constraints for last term
+            model.Add(var2 >= var1 + reduced_gap).OnlyEnforceIf([far_enough_after_last_term, either_in_last_term])
+            model.Add(var2 <= var1 - reduced_gap).OnlyEnforceIf([far_enough_before_last_term, either_in_last_term])
+
+            # Combine normal and last term constraints
+            model.AddBoolOr([far_enough_after_normal, far_enough_before_normal]).OnlyEnforceIf([too_close.Not(), either_in_last_term.Not()])
+            model.AddBoolOr([far_enough_after_last_term, far_enough_before_last_term]).OnlyEnforceIf([too_close.Not(), either_in_last_term])
+
+            # Add violation constraints
+            model.Add(var2 < var1 + reduced_gap).OnlyEnforceIf([too_close, either_in_last_term])
+            model.Add(var2 > var1 - reduced_gap).OnlyEnforceIf([too_close, either_in_last_term])
+            model.Add(var2 < var1 + gap_weeks).OnlyEnforceIf([too_close, either_in_last_term.Not()])
+            model.Add(var2 > var1 - gap_weeks).OnlyEnforceIf([too_close, either_in_last_term.Not()])
+
+            # Create a penalty variable for this affinity pair
+            penalty = model.NewIntVar(0, 1, f"affinity_penalty_{c1}_{c2}_{run1}_{run2}")
+            model.Add(penalty == 1).OnlyEnforceIf(too_close)
+            model.Add(penalty == 0).OnlyEnforceIf(too_close.Not())
             
-            # Use an indicator variable for positive/negative difference
-            is_positive = model.NewBoolVar(f"is_positive_{c1}_{c2}_{run1}_{run2}")
-            model.Add(week_diff >= 0).OnlyEnforceIf(is_positive)
-            model.Add(week_diff < 0).OnlyEnforceIf(is_positive.Not())
-            
-            # Set actual_gap based on absolute value of difference
-            model.Add(actual_gap == week_diff).OnlyEnforceIf(is_positive)
-            model.Add(actual_gap == -week_diff).OnlyEnforceIf(is_positive.Not())
+            # Add penalty to the list
+            affinity_penalties.append(penalty)
 
-            # Calculate required gap based on whether we're in last term
-            required_gap = model.NewIntVar(0, max_weeks, f"required_gap_{c1}_{c2}_{run1}_{run2}")
-            model.Add(required_gap == gap_weeks).OnlyEnforceIf(either_in_last_term.Not())
-            model.Add(required_gap == reduced_gap).OnlyEnforceIf(either_in_last_term)
-
-            # Calculate violation amount (how much shorter than required gap)
-            is_violation = model.NewBoolVar(f"is_violation_{c1}_{c2}_{run1}_{run2}")
-            model.Add(actual_gap < required_gap).OnlyEnforceIf(is_violation)
-            model.Add(actual_gap >= required_gap).OnlyEnforceIf(is_violation.Not())
-
-            model.Add(gap_violation == 0).OnlyEnforceIf(is_violation.Not())
-            model.Add(gap_violation == required_gap - actual_gap).OnlyEnforceIf(is_violation)
-
-            # Add proportional penalty to the list
-            affinity_penalties.append(gap_violation)
-
-            print(f"  Added proportional affinity constraint: {c1} and {c2} should be {gap_weeks} weeks apart (reduced to {reduced_gap} in last term Sep-Dec)")
+            print(f"  Added affinity constraint: {c1} and {c2} should be {gap_weeks} weeks apart (reduced to {reduced_gap} in last term Sep-Dec)")
             
             # Log each affinity constraint with shortened course names for readability
             c1_short = c1[:40] + "..." if len(c1) > 40 else c1
             c2_short = c2[:40] + "..." if len(c2) > 40 else c2
-            log_message = f"Added proportional affinity constraint: {c1_short} and {c2_short} should be {gap_weeks} weeks apart (reduced to {reduced_gap} in last term Sep-Dec)"
+            log_message = f"Added affinity constraint: {c1_short} and {c2_short} should be {gap_weeks} weeks apart (reduced to {reduced_gap} in last term Sep-Dec)"
             log_progress(log_message)
 
         # CONSTRAINT 4: Trainer-specific constraints
@@ -1105,9 +995,13 @@ class CourseScheduler:
                 model.Add(total_workload <= max_days).OnlyEnforceIf(is_over_max.Not())
                 model.Add(over_max == total_workload - max_days).OnlyEnforceIf(is_over_max)
                 model.Add(over_max == 0).OnlyEnforceIf(is_over_max.Not())
-                workload_violation_penalties.append(over_max)  # Add the actual violation amount
+                # Create weighted penalty variable
+                over_max_penalty = model.NewIntVar(0, max_days * 30, f"{trainer}_over_max_penalty")
+                model.Add(over_max_penalty == over_max * 30)  # Weight of 30 for each day over max
+                workload_violation_penalties.append(over_max_penalty)
 
                 # Handle under min days violation with higher proportional penalty
+                min_days = self.consultant_data.loc[self.consultant_data["Name"] == trainer, "Min_Days"].iloc[0]
                 if min_days > 0:  # Only add minimum constraint if min_days is set
                     under_min = model.NewIntVar(0, min_days, f"{trainer}_days_under_min")
                     is_under_min = model.NewBoolVar(f"{trainer}_is_under_min")
@@ -1115,7 +1009,10 @@ class CourseScheduler:
                     model.Add(total_workload >= min_days).OnlyEnforceIf(is_under_min.Not())
                     model.Add(under_min == min_days - total_workload).OnlyEnforceIf(is_under_min)
                     model.Add(under_min == 0).OnlyEnforceIf(is_under_min.Not())
-                    workload_violation_penalties.append(under_min)  # Add the actual violation amount
+                    # Create weighted penalty variable
+                    under_min_penalty = model.NewIntVar(0, min_days * 50, f"{trainer}_under_min_penalty")
+                    model.Add(under_min_penalty == under_min * 50)  # Weight of 50 for each day under min
+                    workload_violation_penalties.append(under_min_penalty)
 
         # Add hard constraint: Champions must teach at least one instance of their course
         print("Adding champion teaching requirements...")
@@ -1253,7 +1150,8 @@ class CourseScheduler:
             # Combined objective function with course scheduling priority
             model.Minimize(
                 50 * sum(unscheduled_course_penalties) +  # Highest priority
-                workload_violation_weight * sum(workload_violation_penalties) +   # Second priority
+                30 * sum(workload_violation_penalties) +   # Second priority
+                20 * sum(spacing_violation_penalties) +    # Third priority
                 monthly_weight * sum(month_deviation_penalties) +
                 affinity_weight * sum(affinity_penalties) +
                 unscheduled_weight * sum(priority_penalties)
@@ -1263,14 +1161,14 @@ class CourseScheduler:
             model.Minimize(
                 monthly_weight * sum(month_deviation_penalties) +
                 affinity_weight * sum(affinity_penalties) +
-                workload_violation_weight * sum(workload_violation_penalties)
+                30 * sum(workload_violation_penalties) +   # High weight for workload violations
+                20 * sum(spacing_violation_penalties)      # Medium weight for spacing violations
             )
 
         # Initialize solver with customized parameters
         solver = cp_model.CpSolver()
         solver.parameters.max_time_in_seconds = solver_time_minutes * 60  # Convert to seconds
         solver.parameters.num_search_workers = num_workers
-        solver.parameters.random_seed = random_seed  # Ensures reproducibility
         
         # Add additional parameters to enforce time limit more strictly
         solver.parameters.log_search_progress = True
@@ -1279,156 +1177,14 @@ class CourseScheduler:
         
         # Create a callback to track time
         class TimeoutCallback(cp_model.CpSolverSolutionCallback):
-            def __init__(self, time_limit, scheduler, schedule, trainer_assignments, adjusted_f2f_demand, weights):
+            def __init__(self, time_limit):
                 cp_model.CpSolverSolutionCallback.__init__(self)
                 self._time_limit = time_limit
                 self._start_time = datetime.datetime.now()
                 self._stop_search = False
                 self._first_solution_time = None
                 self._solution_count = 0
-                self._scheduler = scheduler
-                self._schedule = schedule
-                self._trainer_assignments = trainer_assignments
-                self._adjusted_f2f_demand = adjusted_f2f_demand
-                self._weights = weights  # Store weights passed from optimizer
                 
-            def calculate_normalized_metrics(self):
-                # Calculate normalization factors
-                total_courses = sum(self._scheduler.course_run_data["Runs"])
-                total_required_gaps = sum(row["Gap Weeks"] for _, row in self._scheduler.affinity_matrix_data.iterrows())
-                total_course_days = sum(self._scheduler.course_run_data["Runs"] * self._scheduler.course_run_data["Duration"])
-                
-                # Calculate monthly deviation
-                monthly_deviation = 0
-                monthly_raw = []  # Store raw deviations per month
-                for month in range(1, 13):
-                    target = self._adjusted_f2f_demand.get(month, 0)
-                    actual = sum(1 for (_, _, _, _), week_var in self._schedule.items() 
-                               if self._scheduler.week_to_month_map.get(self.Value(week_var), 0) == month)
-                    deviation = abs(target - actual)
-                    monthly_deviation += deviation
-                    monthly_raw.append(f"Month {month}: Target={target}, Actual={actual}, Diff={deviation}")
-                monthly_pct = monthly_deviation / total_courses * 100 if total_courses > 0 else 0
-
-                # Calculate affinity violations with better categorization
-                affinity_violations = 0
-                violated_pairs = set()  # Use a set to track unique violated pairs
-                affinity_raw = []
-                unscheduled_pairs = []
-                wrong_gap_pairs = []
-                
-                for _, row in self._scheduler.affinity_matrix_data.iterrows():
-                    c1, c2, gap_weeks = row["Course 1"], row["Course 2"], row["Gap Weeks"]
-                    
-                    # Get all scheduled weeks for both courses
-                    c1_weeks = []
-                    c2_weeks = []
-                    
-                    for (course, _, language, _), week_var in self._schedule.items():
-                        week_val = self.Value(week_var)
-                        if week_val > 0:  # Only count scheduled courses
-                            if course == c1:
-                                c1_weeks.append(week_val)
-                            elif course == c2:
-                                c2_weeks.append(week_val)
-                    
-                    # If either course is not scheduled, count as unscheduled pair
-                    if not c1_weeks or not c2_weeks:
-                        unscheduled_pairs.append(f"{c1}-{c2}: Required gap={gap_weeks} weeks (Unscheduled)")
-                        affinity_violations += gap_weeks  # Add full gap as violation
-                        violated_pairs.add((c1, c2))
-                        continue
-                    
-                    # Check all combinations of scheduled weeks
-                    for w1 in c1_weeks:
-                        for w2 in c2_weeks:
-                            gap = abs(w1 - w2)
-                            # Check if this is in last term (Sep-Dec)
-                            m1 = self._scheduler.week_to_month_map.get(w1, 0)
-                            m2 = self._scheduler.week_to_month_map.get(w2, 0)
-                            is_last_term = m1 >= 9 or m2 >= 9
-                            required_gap = gap_weeks - 1 if is_last_term else gap_weeks
-                            
-                            if gap < required_gap:
-                                violation = required_gap - gap
-                                affinity_violations += violation
-                                violated_pairs.add((c1, c2))
-                                wrong_gap_pairs.append(
-                                    f"{c1}-{c2}: Required={required_gap}, Actual={gap}, "
-                                    f"Violation={violation} (Last term: {is_last_term})"
-                                )
-                                break  # Count only one violation per pair
-                        if (c1, c2) in violated_pairs:
-                            break
-
-                # Summarize affinity violations
-                if unscheduled_pairs:
-                    affinity_raw.append("\nUnscheduled Course Pairs:")
-                    affinity_raw.append(f"Total: {len(unscheduled_pairs)} pairs")
-                    for pair in unscheduled_pairs[:5]:  # Show only first 5 examples
-                        affinity_raw.append(f"  {pair}")
-                    if len(unscheduled_pairs) > 5:
-                        affinity_raw.append(f"  ... and {len(unscheduled_pairs)-5} more pairs")
-
-                if wrong_gap_pairs:
-                    affinity_raw.append("\nWrong Gap Violations:")
-                    affinity_raw.append(f"Total: {len(wrong_gap_pairs)} pairs")
-                    for pair in wrong_gap_pairs[:5]:  # Show only first 5 examples
-                        affinity_raw.append(f"  {pair}")
-                    if len(wrong_gap_pairs) > 5:
-                        affinity_raw.append(f"  ... and {len(wrong_gap_pairs)-5} more pairs")
-
-                affinity_pct = affinity_violations / total_required_gaps * 100 if total_required_gaps > 0 else 0
-
-                # Calculate workload violations
-                workload_violations = 0
-                workload_raw = []  # Store raw violations per trainer
-                for trainer in self._scheduler.consultant_data["Name"]:
-                    max_days = self._scheduler.consultant_data.loc[
-                        self._scheduler.consultant_data["Name"] == trainer, "Max_Days"].iloc[0]
-                    min_days = self._scheduler.consultant_data.loc[
-                        self._scheduler.consultant_data["Name"] == trainer, "Min_Days"].iloc[0]
-                    assigned_days = 0
-                    for (course, _, language, i), week_var in self._schedule.items():
-                        if (course, "F2F", language, i) in self._trainer_assignments:
-                            trainer_var = self._trainer_assignments[(course, "F2F", language, i)]
-                            trainer_idx = self.Value(trainer_var)
-                            if (course, language) in self._scheduler.fleximatrix:
-                                qualified_trainers = self._scheduler.fleximatrix[(course, language)]
-                                if 0 <= trainer_idx < len(qualified_trainers) and qualified_trainers[trainer_idx] == trainer:
-                                    duration = self._scheduler.course_run_data.loc[
-                                        self._scheduler.course_run_data["Course Name"] == course, "Duration"].iloc[0]
-                                    assigned_days += duration
-                
-                    if assigned_days > max_days:
-                        violation = assigned_days - max_days
-                        workload_violations += violation
-                        workload_raw.append(f"{trainer}: Max={max_days}, Assigned={assigned_days}, Over by={violation}")
-                    elif assigned_days < min_days and min_days > 0:
-                        violation = min_days - assigned_days
-                        workload_violations += violation
-                        workload_raw.append(f"{trainer}: Min={min_days}, Assigned={assigned_days}, Under by={violation}")
-                workload_pct = workload_violations / total_course_days * 100 if total_course_days > 0 else 0
-
-                return {
-                    'monthly': {
-                        'pct': monthly_pct,
-                        'raw': monthly_raw,
-                        'total_violation': monthly_deviation
-                    },
-                    'affinity': {
-                        'pct': affinity_pct,
-                        'raw': affinity_raw,
-                        'total_violation': affinity_violations,
-                        'violated_pairs_count': len(violated_pairs)  # Add count of unique violated pairs
-                    },
-                    'workload': {
-                        'pct': workload_pct,
-                        'raw': workload_raw,
-                        'total_violation': workload_violations
-                    }
-                }
-
             def on_solution_callback(self):
                 try:
                     self._solution_count += 1
@@ -1436,73 +1192,20 @@ class CourseScheduler:
                     elapsed_seconds = (current_time - self._start_time).total_seconds()
                     
                     if self._solution_count == 1:
-                        self._first_solution_time = elapsed_seconds
-                    
-                    # Calculate normalized metrics
-                    metrics = self.calculate_normalized_metrics()
-                    
-                    # Format the output
-                    print(f"\nSolution {self._solution_count} at {elapsed_seconds:.1f}s:")
-                    
-                    print("\nDetailed Violations:")
-                    
-                    # Monthly Distribution Details
-                    if metrics['monthly']['raw']:
-                        print("\nMonthly Distribution Details:")
-                        for detail in metrics['monthly']['raw']:
-                            print(f"  {detail}")
-                    
-                    # Affinity Violation Summary
-                    if metrics['affinity']['raw']:
-                        print("\nAffinity Violation Summary:")
-                        print(f"  Total unique course pairs with violations: {metrics['affinity']['violated_pairs_count']}")
-                        for detail in metrics['affinity']['raw']:
-                            print(f"  {detail}")
-                    
-                    # Workload Details
-                    if metrics['workload']['raw']:
-                        print("\nWorkload Violation Details:")
-                        for detail in metrics['workload']['raw']:
-                            print(f"  {detail}")
-
-                    # Print solution summary at the end
-                    print("\nSOLUTION SUMMARY")
-                    print("=" * 50)
-                    print("Penalty Percentages and Weights:")
-                    print(f"Monthly Distribution: {metrics['monthly']['pct']:.2f}% * {self._weights['monthly']} (weight)")
-                    print(f"Affinity Rules: {metrics['affinity']['pct']:.2f}% * {self._weights['affinity']} (weight)")
-                    print(f"Workload: {metrics['workload']['pct']:.2f}% * {self._weights['workload']} (weight)")
-                    
-                    # Calculate objective components
-                    monthly_contrib = metrics['monthly']['pct'] * self._weights['monthly'] / 100
-                    affinity_contrib = metrics['affinity']['pct'] * self._weights['affinity'] / 100
-                    workload_contrib = metrics['workload']['pct'] * self._weights['workload'] / 100
-                    
-                    # Calculate total objective value
-                    total_objective = monthly_contrib + affinity_contrib + workload_contrib
-                    
-                    print("\nObjective Components:")
-                    print(f"Monthly: {monthly_contrib:.2f}")
-                    print(f"Affinity: {affinity_contrib:.2f}")
-                    print(f"Workload: {workload_contrib:.2f}")
-                    print(f"Total Objective Value: {total_objective:.2f}")
-                    
-                    max_possible = self._weights['monthly'] + self._weights['affinity'] + self._weights['workload']
-                    print(f"Maximum Possible Objective: {max_possible:.2f}")
-                    print("=" * 50)
-                    
-                    print("\n" + "-"*80)  # Separator line
-                    
+                        log_progress(f"First solution found in {elapsed_seconds:.1f} seconds", 0.75)
+                    elif self._solution_count % 10 == 0:  # Log every 10 solutions
+                        log_progress(f"Found {self._solution_count} solutions in {elapsed_seconds:.1f} seconds", 0.80)
                 except Exception as e:
-                    print(f"Error in callback: {str(e)}")
-            
+                    # Catch any errors in the callback to prevent crashes
+                    pass
+                
             def solution_count(self):
                 return self._solution_count
         
         log_progress(f"Configuring solver with {solver_time_minutes} minute time limit...", 0.60)
         
         # Create and use the timeout callback
-        timeout_callback = TimeoutCallback(solver_time_minutes * 60, self, schedule, trainer_assignments, adjusted_f2f_demand, self.weights)  # Use self.weights to ensure we pass the correct weights
+        timeout_callback = TimeoutCallback(solver_time_minutes * 60)
         solution_counter = timeout_callback
 
         # Set solution strategy
@@ -1573,75 +1276,6 @@ class CourseScheduler:
         print(f"Solver status: {solver.StatusName(status)}")
         print(f"Objective value: {solver.ObjectiveValue()}")
         print(f"Wall time: {solver.WallTime():.2f} seconds")
-
-        # Calculate and display final normalized penalties
-        if status in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
-            # Calculate normalization factors
-            total_courses = sum(self.course_run_data["Runs"])
-            total_required_gaps = sum(row["Gap Weeks"] for _, row in self.affinity_matrix_data.iterrows())
-            total_course_days = sum(self.course_run_data["Runs"] * self.course_run_data["Duration"])
-            
-            # Ensure no division by zero
-            total_courses = max(1, total_courses)
-            total_required_gaps = max(1, total_required_gaps)
-            total_course_days = max(1, total_course_days)
-
-            print("\nFinal Solution Quality Metrics:")
-            print("--------------------------------")
-            
-            # Calculate monthly distribution deviation
-            monthly_deviation = 0
-            for month in range(1, 13):
-                target = adjusted_f2f_demand.get(month, 0)
-                actual = sum(1 for (_, _, _, _), week_var in schedule.items() 
-                           if self.week_to_month_map.get(solver.Value(week_var), 0) == month)
-                monthly_deviation += abs(target - actual)
-            monthly_deviation_pct = (monthly_deviation * 100) / total_courses
-            print(f"Monthly Distribution Deviation: {monthly_deviation_pct:.2f}%")
-
-            # Calculate affinity violations
-            affinity_violations = 0
-            for _, row in self.affinity_matrix_data.iterrows():
-                c1, c2, gap_weeks = row["Course 1"], row["Course 2"], row["Gap Weeks"]
-                for (course1, _, _, i1), week1 in schedule.items():
-                    if course1 == c1:
-                        for (course2, _, _, i2), week2 in schedule.items():
-                            if course2 == c2:
-                                actual_gap = abs(solver.Value(week1) - solver.Value(week2))
-                                if actual_gap < gap_weeks:
-                                    affinity_violations += (gap_weeks - actual_gap)
-            affinity_violations_pct = (affinity_violations * 100) / total_required_gaps
-            print(f"Affinity Rule Violations: {affinity_violations_pct:.2f}%")
-
-            # Calculate workload violations
-            workload_violations = 0
-            for trainer in self.consultant_data["Name"]:
-                max_days = self.consultant_data.loc[self.consultant_data["Name"] == trainer, "Max_Days"].iloc[0]
-                min_days = self.consultant_data.loc[self.consultant_data["Name"] == trainer, "Min_Days"].iloc[0]
-                assigned_days = 0
-                for (course, _, language, i), week_var in schedule.items():
-                    if (course, delivery_type, language, i) in trainer_assignments:
-                        trainer_var = trainer_assignments[(course, delivery_type, language, i)]
-                        trainer_idx = solver.Value(trainer_var)
-                        if (course, language) in self.fleximatrix:
-                            qualified_trainers = self.fleximatrix[(course, language)]
-                            if 0 <= trainer_idx < len(qualified_trainers) and qualified_trainers[trainer_idx] == trainer:
-                                duration = self.course_run_data.loc[self.course_run_data["Course Name"] == course, "Duration"].iloc[0]
-                                assigned_days += duration
-                if assigned_days > max_days:
-                    workload_violations += (assigned_days - max_days)
-                elif assigned_days < min_days:
-                    workload_violations += (min_days - assigned_days)
-            workload_violations_pct = (workload_violations * 100) / total_course_days
-            print(f"Workload Violations: {workload_violations_pct:.2f}%")
-
-            if prioritize_all_courses:
-                unscheduled = len([1 for (_, _, _, _), week_var in schedule.items() 
-                                 if solver.Value(week_var) == 0])
-                unscheduled_pct = (unscheduled * 100) / total_courses
-                print(f"Unscheduled Courses: {unscheduled_pct:.2f}%")
-
-            print("--------------------------------")
 
         print("Final Weekly Course Schedule with Trainers:")
         if status in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
@@ -1859,6 +1493,7 @@ class CourseScheduler:
 
                     if skip_week:
                         model.Add(week_var != week)
+
         # Check feasibility with week restrictions
         status = solver.Solve(model)
         feasible = status in [cp_model.OPTIMAL, cp_model.FEASIBLE]
@@ -2008,7 +1643,7 @@ class CourseScheduler:
             model.AddBoolOr(c2_last_term_choices).OnlyEnforceIf(is_c2_q4)
             model.AddBoolAnd([choice.Not() for choice in c2_last_term_choices]).OnlyEnforceIf(is_c2_q4.Not())
 
-            # Either course is in last term
+            # Either course in Q4 means reduced gap
             either_in_last_term = model.NewBoolVar(f"{c1}_{c2}_either_in_last_term")
             model.AddBoolOr([is_c1_q4, is_c2_q4]).OnlyEnforceIf(either_in_last_term)
             model.AddBoolAnd([is_c1_q4.Not(), is_c2_q4.Not()]).OnlyEnforceIf(either_in_last_term.Not())
@@ -2148,17 +1783,8 @@ class CourseScheduler:
         # Choose optimization mode
         mode = "prioritize_all" if prioritize_all_courses else "regular"
 
-        # Create the objective function
-        penalties = {
-            "monthly": month_deviation_penalties,
-            "affinity": affinity_penalties,
-            "workload": workload_violation_penalties,
-            "unscheduled": unscheduled_course_penalties,
-            "spacing": spacing_violation_penalties
-        }
-
-        # Create the objective function with the weights
-        self._create_objective_function(model, penalties, mode="regular" if not prioritize_all_courses else "prioritize_all", weights=weights)
+        # Create and add objective function
+        self._create_objective_function(model, penalties, mode, weights[mode])
 
         # Solve with final model
         solver = cp_model.CpSolver()
@@ -2757,7 +2383,7 @@ class CourseScheduler:
                         worksheet.column_dimensions[col_letter].width = min(max_length + 2, 50)
                 else:
                     pd.DataFrame(columns=['No affinity violations found']).to_excel(writer, sheet_name='Affinity Violations', index=False)
-            
+
             # Create the new Calendar View sheet
             if schedule_df is not None and not schedule_df.empty:
                 # Get all trainers from the consultant data
@@ -3512,12 +3138,10 @@ def main():
                     # Priority Weight Sliders in a nice frame
                     st.markdown('<div class="slider-container">', unsafe_allow_html=True)
                     st.markdown('<div class="slider-header">Priority Weights</div>', unsafe_allow_html=True)
-                    monthly_weight = st.slider("Monthly Distribution Priority", 1, 100, 5,
+                    monthly_weight = st.slider("Monthly Distribution Priority", 1, 10, 5,
                                                help="Higher values enforce monthly targets more strictly")
-                    affinity_weight = st.slider("Course Affinity Priority", 1, 100, 2,
+                    affinity_weight = st.slider("Course Affinity Priority", 1, 10, 2,
                                                 help="Higher values enforce gaps between related courses")
-                    workload_violation_weight = st.slider("Workload Violation Priority", 1, 100, 30,
-                                                help="Higher values enforce trainer workload limits more strictly")
                     st.markdown('</div>', unsafe_allow_html=True)
 
                     # Constraint Management sliders in a nice frame
@@ -3623,7 +3247,6 @@ def main():
                                 status, schedule_df, solver, schedule, trainer_assignments, unscheduled_courses = st.session_state.scheduler.run_optimization(
                                     monthly_weight=monthly_weight,
                                     affinity_weight=affinity_weight,
-                                    workload_violation_weight=workload_violation_weight,
                                     solver_time_minutes=solver_time,
                                     num_workers=num_workers,
                                     min_course_spacing=min_course_spacing,
@@ -4254,6 +3877,5 @@ if __name__ == "__main__":
     # Add this before your main() call
     st.write("App is running")
     main()
-
 
 
